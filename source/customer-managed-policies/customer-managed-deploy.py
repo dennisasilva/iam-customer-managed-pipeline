@@ -53,11 +53,11 @@ def get_current_customer_managed_policies():
 
 # This method will return all customer managed policies in the specified folder
 def get_repository_customer_managed_policies():
-    policy_files = os.listdir('../../templates/policies/')
+    policy_files = os.listdir('../../templates/customer-managed-policies/')
     policies_dict = {}
 
     for policy_file in policy_files:
-        path = '../../templates/policies/' + policy_file
+        path = '../../templates/customer-managed-policies/' + policy_file
         with open(path) as f:
             data = json.load(f)
             policies_dict[data['PolicyName']] = data
