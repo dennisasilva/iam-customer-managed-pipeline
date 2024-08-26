@@ -78,9 +78,9 @@ def create_or_update_policy(policy_name, policy_document):
                 PolicyDocument=json.dumps(policy_document),
                 SetAsDefault=True
             )
-            log.info(f"[Policy: {policy_name}] Successfully updated policy.")
+            log.info(f"[Policy: {policy_name}] policy updated successfully.")
         except Exception as e:
-            log.error(f"[Policy: {policy_name}] Could not update policy. Reason: {str(e)}")
+            log.error(f"[Policy: {policy_name}] could not be update. Reason: {str(e)}")
             exit(1)
     else:
         # Create new policy
@@ -90,9 +90,9 @@ def create_or_update_policy(policy_name, policy_document):
                 PolicyName=policy_name,
                 PolicyDocument=json.dumps(policy_document),
             )
-            log.info(f"[Policy: {policy_name}] Successfully created policy.")
+            log.info(f"[Policy: {policy_name}] has been created successfully.")
         except Exception as e:
-            log.error(f"[Policy: {policy_name}] Could not create policy. Reason: {str(e)}")
+            log.error(f"[Policy: {policy_name}] could not create policy. Reason: {str(e)}")
             exit(1)
 
 # Delete a customer managed policy
