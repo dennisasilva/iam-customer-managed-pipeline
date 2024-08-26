@@ -13,7 +13,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## + ----------------------------------
+## + -----------------------------------
 ## | AWS Managed Policies Validation
 ## + -----------------------------------
 
@@ -26,12 +26,12 @@ import logging
 
 """
 Arguments used by the script:
---policies-folder: Folder where the customer-managed policy files are stored. Default: '../templates/policies/'
+--policies-folder: Folder where the customer-managed policy files are stored. Default: '../templates/customer-managed-policies/'
 """
 
 # Setting arguments
-parser = argparse.ArgumentParser(description='AWS Managed Policies Validation')
-parser.add_argument('--policies-folder', action="store", dest='policiesFolder', default='../templates/policies/')
+parser = argparse.ArgumentParser(description='Customer Managed Policies Validation')
+parser.add_argument('--policies-folder', action="store", dest='policiesFolder', default='../templates/customer-managed-policies/')
 args = parser.parse_args()
 
 # Logging configuration
@@ -88,29 +88,16 @@ def validate_json_policy_format():
                 exit(1)
             if eachFinding['findingType'] == 'WARNING':
                 log.warning(f"[{policy_name}] An issue was found in the policy: " + str(eachFinding['findingDetails']))
-    
-def validate_managed_policies_arn():
-    log.info("Analyzing attached managed policies in each customer-managed policy.") 
-    client = boto3.client('iam')
-
-    for policy_name, policy in policies.items():
-        if 'AttachedPolicies' in policy:
-            for managed_policy_arn in policy['AttachedPolicies']:
-                try:
-                    client.get_policy(PolicyArn=managed_policy_arn)
-                except Exception as error:
-                    log.error(f"[{policy_name}] An issue was found with the managed policy ARN: " + str(error))
-                    exit(1)
 
 def main():
     print("########################################")
-    print("# Starting AWS Managed Policies Validation #")
+    print("# Starting Customer Managed Policies Validation #")
     print("########################################\n")
     
     # Check if policy folder argument exists
     if args.policiesFolder is None:
         print ("Usage: python " + str(sys.argv[0]) +  " --policies-folder <POLICIES_FOLDER>")
-        print ("Example: python " + str(sys.argv[0]) +  " --policies-folder '../templates/policies/'")
+        print ("Example: python " + str(sys.argv[0]) +  " --policies-folder '../templates/customer-managed-policies/'")
         exit()
 
     # Load policy files from folder to global variable
