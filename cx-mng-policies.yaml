@@ -1,481 +1,481 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
-# Permission is hereby granted, free of charge, to any person obtaining a copy of this
-# software and associated documentation files (the "Software"), to deal in the Software
-# without restriction, including without limitation the rights to use, copy, modify,
-# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so.
+  # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  # software and associated documentation files (the "Software"), to deal in the Software
+  # without restriction, including without limitation the rights to use, copy, modify,
+  # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  # permit persons to whom the Software is furnished to do so.
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+  # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+  # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-AWSTemplateFormatVersion: "2010-09-09"
-Description: 'Create a CI/CD pipeline to deploy IAM Customer Managed Policies in AWS accounts'
+  AWSTemplateFormatVersion: "2010-09-09"
+  Description: 'Create a CI/CD pipeline to deploy IAM Customer Managed Policies in AWS accounts'
 
-## +-------------+ ##
-## |  Parameters |
-## +-------------+ ##
+  ## +-------------+ ##
+  ## |  Parameters | ##
+  ## +-------------+ ##
 
-Parameters:
-  RepositoryType:
-    Description: "Select the repository type you want to create a CodeStar connection for"
-    Type: String
-    AllowedValues:
-      - GitHub
-      - GitLab
-    Default: GitHub
-    ConstraintDescription: "Must be either GitHub or GitLab"
+  Parameters:
+    RepositoryType:
+      Description: "Select the repository type you want to create a CodeStar connection for"
+      Type: String
+      AllowedValues:
+        - GitHub
+        - GitLab
+      Default: GitHub
+      ConstraintDescription: "Must be either GitHub or GitLab"
 
-  S3BucketCodeBucket:
-    Description: 'S3 bucket with the initial repository code. Must be created in advance.'
-    Type: String
-    Default: 'iam-cx-mng-pipeline-initialcode'
+    S3BucketCodeBucket:
+      Description: 'S3 bucket with the initial repository code. Must be created in advance.'
+      Type: String
+      Default: 'iam-cx-mng-pipeline-initialcode'
 
-  S3BucketCodeKey:
-    Description: 'Name of the zip file with the repository initial code hosted in S3 bucket above'
-    Type: String
-    Default: 'iam-cx-mng-pipeline.zip'
+    S3BucketCodeKey:
+      Description: 'Name of the zip file with the repository initial code hosted in S3 bucket above'
+      Type: String
+      Default: 'iam-cx-mng-pipeline.zip'
 
-  RepositoryName:
-    Description: 'Name of the GitHub reposiroty'
-    Type: String
-    Default: 'iam-cx-mng-pipeline'
+    RepositoryName:
+      Description: 'Name of the GitHub reposiroty'
+      Type: String
+      Default: 'iam-cx-mng-pipeline'
 
-  RepositoryOwner:
-    Description: 'Username Github Owner'
-    Type: String
-    Default: 'dennisasilva'
+    RepositoryOwner:
+      Description: 'Username Github Owner'
+      Type: String
+      Default: 'dennisasilva'
 
-  SecretId:
-    Description: 'Insert the secret name value here'
-    Type: String
-    Default: 'dev/cx-mgn-pipe/github'
+    SecretId:
+      Description: 'Insert the secret name value here'
+      Type: String
+      Default: 'dev/cx-mgn-pipe/github'
 
-## +------------------------------------------------------+ ##
-## | Create a condition to select the CodeStarConnection  | ##
-## +------------------------------------------------------+ ##
+  ## +------------------------------------------------------+ ##
+  ## | Create a condition to select the CodeStarConnection  | ##
+  ## +------------------------------------------------------+ ##
 
-Conditions:
-  CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
-  CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
+  Conditions:
+    CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
+    CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
 
-Resources:
+  Resources:
 
-## +--------------------------------------------------------------------+ ##
-## | Create a CodeStar connection type based on reposirotyType variable | ##
-## +--------------------------------------------------------------------+ ##
+  ## +--------------------------------------------------------------------+ ##
+  ## | Create a CodeStar connection type based on reposirotyType variable | ##
+  ## +--------------------------------------------------------------------+ ##
 
-  CodeStarConnectionGitHub:
-    Type: AWS::CodeStarConnections::Connection
-    Condition: CreateCodeStarConnectionGitHub
-    Properties:
-      ConnectionName: !Sub ${AWS::StackName}-gitHub
-      ProviderType: GitHub
+    CodeStarConnectionGitHub:
+      Type: AWS::CodeStarConnections::Connection
+      Condition: CreateCodeStarConnectionGitHub
+      Properties:
+        ConnectionName: !Sub ${AWS::StackName}-gitHub
+        ProviderType: GitHub
 
-  CodeStarConnectionGitLab:
-    Type: AWS::CodeStarConnections::Connection
-    Condition: CreateCodeStarConnectionGitLab
-    Properties:
-      ConnectionName: !Sub ${AWS::StackName}-gitLab
-      ProviderType: GitLab
+    CodeStarConnectionGitLab:
+      Type: AWS::CodeStarConnections::Connection
+      Condition: CreateCodeStarConnectionGitLab
+      Properties:
+        ConnectionName: !Sub ${AWS::StackName}-gitLab
+        ProviderType: GitLab
 
-## +----------------------------+ ##
-## | Create a GitHub Repository | ##
-## +----------------------------+ ##
+  ## +----------------------------+ ##
+  ## | Create a GitHub Repository | ##
+  ## +----------------------------+ ##
 
-  CxMngGitHubRepository:
-    Type: AWS::CodeStar::GitHubRepository
-    Properties:
-      Code:
-        S3:
-          Bucket: !Ref S3BucketCodeBucket
-          Key: !Ref S3BucketCodeKey
-      EnableIssues: true
-      IsPrivate: true
-      RepositoryAccessToken: !Sub '{{resolve:secretsmanager:${SecretId}::::}}'
-      RepositoryDescription: This GitHub repository will host code to manage AWS IAM Customer Managed Policies
-      RepositoryName: !Ref RepositoryName
-      RepositoryOwner: !Ref RepositoryOwner
+    CxMngGitHubRepository:
+      Type: AWS::CodeStar::GitHubRepository
+      Properties:
+        Code:
+          S3:
+            Bucket: !Ref S3BucketCodeBucket
+            Key: !Ref S3BucketCodeKey
+        EnableIssues: true
+        IsPrivate: true
+        RepositoryAccessToken: !Sub '{{resolve:secretsmanager:${SecretId}::::}}'
+        RepositoryDescription: This GitHub repository will host code to manage AWS IAM Customer Managed Policies
+        RepositoryName: !Ref RepositoryName
+        RepositoryOwner: !Ref RepositoryOwner
 
-## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create the CodeBuild for stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
-## +---------------------------------------------------------------------------------------------------------+ ##
+  ## +---------------------------------------------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild for stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
+  ## +---------------------------------------------------------------------------------------------------------+ ##
 
-  TemplateValidationCodeBuildProject:
-    Type: AWS::CodeBuild::Project
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W32
-            reason: The CodeBuild is going to use the AWS Managed key.
-    Properties:
-      Name: !Sub ${AWS::StackName}-template-validation
-      ServiceRole: !GetAtt CodeBuildRoleTemplateValidation.Arn
-      Artifacts:
-        Type: CODEPIPELINE
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
-      Source:
-        Type: CODEPIPELINE
-        BuildSpec: codebuild/template-validation/buildspec.yaml
+    TemplateValidationCodeBuildProject:
+      Type: AWS::CodeBuild::Project
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W32
+              reason: The CodeBuild is going to use the AWS Managed key.
+      Properties:
+        Name: !Sub ${AWS::StackName}-template-validation
+        ServiceRole: !GetAtt CodeBuildRoleTemplateValidation.Arn
+        Artifacts:
+          Type: CODEPIPELINE
+        Environment:
+          Type: LINUX_CONTAINER
+          ComputeType: BUILD_GENERAL1_SMALL
+          Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Source:
+          Type: CODEPIPELINE
+          BuildSpec: codebuild/template-validation/buildspec.yaml
 
-  CustomerManagedPoliciesCodeBuildProject:
-    Type: AWS::CodeBuild::Project
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W32
-            reason: The CodeBuild is going to use the AWS Managed key.
-    Properties:
-      Name: !Sub ${AWS::StackName}-customer-managed-policies
-      ServiceRole: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
-      Artifacts:
-        Type: CODEPIPELINE
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
-      Source:
-        Type: CODEPIPELINE
-        BuildSpec: codebuild/customer-managed-policies/buildspec.yaml
+    CustomerManagedPoliciesCodeBuildProject:
+      Type: AWS::CodeBuild::Project
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W32
+              reason: The CodeBuild is going to use the AWS Managed key.
+      Properties:
+        Name: !Sub ${AWS::StackName}-customer-managed-policies
+        ServiceRole: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
+        Artifacts:
+          Type: CODEPIPELINE
+        Environment:
+          Type: LINUX_CONTAINER
+          ComputeType: BUILD_GENERAL1_SMALL
+          Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Source:
+          Type: CODEPIPELINE
+          BuildSpec: codebuild/customer-managed-policies/buildspec.yaml
 
-  AssignmentsCodeBuildProject:
-    Type: AWS::CodeBuild::Project
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W32
-            reason: The CodeBuild is going to use the AWS Managed key.
-    Properties:
-      Name: !Sub ${AWS::StackName}-assignments
-      ServiceRole: !GetAtt CodeBuildRoleAssignments.Arn
-      Artifacts:
-        Type: CODEPIPELINE
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
-      Source:
-        Type: CODEPIPELINE
-        BuildSpec: codebuild/assignments/buildspec.yaml
-  
-## +--------------------------------------------------------------------------+ ##
-## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
-## +--------------------------------------------------------------------------+ ##
-  CodeBuildRoleTemplateValidation:
-    Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: The IAM permissions associate is under review.
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - codebuild.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: CodeBuildPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - codecommit:GitPull
-                Resource: "*"
+    AssignmentsCodeBuildProject:
+      Type: AWS::CodeBuild::Project
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W32
+              reason: The CodeBuild is going to use the AWS Managed key.
+      Properties:
+        Name: !Sub ${AWS::StackName}-assignments
+        ServiceRole: !GetAtt CodeBuildRoleAssignments.Arn
+        Artifacts:
+          Type: CODEPIPELINE
+        Environment:
+          Type: LINUX_CONTAINER
+          ComputeType: BUILD_GENERAL1_SMALL
+          Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Source:
+          Type: CODEPIPELINE
+          BuildSpec: codebuild/assignments/buildspec.yaml
+    
+  ## +--------------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
+  ## +--------------------------------------------------------------------------+ ##
+    CodeBuildRoleTemplateValidation:
+      Type: AWS::IAM::Role
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: The IAM permissions associate is under review.
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CodeBuildPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - codecommit:GitPull
+                  Resource: "*"
 
-## +-------------------------------------------------------------------------------+ ##
-## | Create the CodeBuild role for CustomerManagedPoliciesCodeBuildProject project | ##
-## +-------------------------------------------------------------------------------+ ##
-  
-  CodeBuildRoleCustomerManagedPolicies:
-    Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: The IAM permissions associate is under review.
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - codebuild.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: CodeBuildPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - codecommit:GitPull
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                Resource: "*"
+  ## +-------------------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild role for CustomerManagedPoliciesCodeBuildProject project | ##
+  ## +-------------------------------------------------------------------------------+ ##
+    
+    CodeBuildRoleCustomerManagedPolicies:
+      Type: AWS::IAM::Role
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: The IAM permissions associate is under review.
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CodeBuildPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - codecommit:GitPull
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource: "*"
 
-## +-------------------------------------------------------------------+ ##
-## | Create the CodeBuild role for AssignmentsCodeBuildProject project | ##
-## +-------------------------------------------------------------------+ ##
-  
-  CodeBuildRoleAssignments:
-    Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: The IAM permissions associate is under review.
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - codebuild.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: CodeBuildPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - codecommit:GitPull
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - sts:AssumeRole
-                Resource: "*"
+  ## +-------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild role for AssignmentsCodeBuildProject project | ##
+  ## +-------------------------------------------------------------------+ ##
+    
+    CodeBuildRoleAssignments:
+      Type: AWS::IAM::Role
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: The IAM permissions associate is under review.
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CodeBuildPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - codecommit:GitPull
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+                  Resource: "*"
 
-## +--------------------+ ##
-## | S3 Bucket Artifact | ##
-## +--------------------+ ##
-  CxMgrartifactsBucket:
-    Type: 'AWS::S3::Bucket'    
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W35
-            reason: "There is no need to enable log in this bucket."            
-    Properties:
-      BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-cx-mng-artfcs
-      VersioningConfiguration:
-        Status: Enabled
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: 'AES256'
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+  ## +--------------------+ ##
+  ## | S3 Bucket Artifact | ##
+  ## +--------------------+ ##
+    CxMgrartifactsBucket:
+      Type: 'AWS::S3::Bucket'    
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W35
+              reason: "There is no need to enable log in this bucket."            
+      Properties:
+        BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-cx-mng-artfcs
+        VersioningConfiguration:
+          Status: Enabled
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: 'AES256'
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
 
-  CxMgrartifactsBucketPolicy:
-    Type: 'AWS::S3::BucketPolicy'
-    Properties:
-      Bucket: !Ref CxMgrartifactsBucket
-      PolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Sid: HTTPSOnly
-            Effect: Deny
-            Principal:
-              AWS: "*"
-            Action:
-              - s3:*
-            Resource: 
-            - !Sub arn:aws:s3:::${CxMgrartifactsBucket}/*
-            - !Sub arn:aws:s3:::${CxMgrartifactsBucket}
-            Condition:
-              Bool:
-                aws:SecureTransport: false
+    CxMgrartifactsBucketPolicy:
+      Type: 'AWS::S3::BucketPolicy'
+      Properties:
+        Bucket: !Ref CxMgrartifactsBucket
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Sid: HTTPSOnly
+              Effect: Deny
+              Principal:
+                AWS: "*"
+              Action:
+                - s3:*
+              Resource: 
+              - !Sub arn:aws:s3:::${CxMgrartifactsBucket}/*
+              - !Sub arn:aws:s3:::${CxMgrartifactsBucket}
+              Condition:
+                Bool:
+                  aws:SecureTransport: false
 
-## +-----------------------------------------------------------------------------------------------------------+ ##
-## | Create a CodePipeline with stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
-## +-----------------------------------------------------------------------------------------------------------+ ##
+  ## +-----------------------------------------------------------------------------------------------------------+ ##
+  ## | Create a CodePipeline with stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
+  ## +-----------------------------------------------------------------------------------------------------------+ ##
 
-  CodePipeline:
-    Type: AWS::CodePipeline::Pipeline
-    Properties:
-      Name: cx-mng-policies-pipeline
-      RoleArn: !GetAtt CodePipelineRole.Arn
-      ArtifactStore:
-        Type: S3
-        Location: !Ref CxMgrartifactsBucket
-      PipelineType: V2
-      Stages:
-        - Name: Source
-          Actions:
-            - Name: Source
-              InputArtifacts: []
-              ActionTypeId:
-                Category: Source
-                Owner: AWS
-                Version: '1'
-                Provider: CodeStarSourceConnection
-              Configuration:
-                ConnectionArn: !If [ CreateCodeStarConnectionGitHub, !GetAtt CodeStarConnectionGitHub.ConnectionArn, !GetAtt CodeStarConnectionGitLab.ConnectionArn ]
-                FullRepositoryId: !Sub ${RepositoryOwner}/${RepositoryName}
-                BranchName: "main"
-              RunOrder: 1
-              OutputArtifacts:
-                - Name: SourceOutput
+    CodePipeline:
+      Type: AWS::CodePipeline::Pipeline
+      Properties:
+        Name: cx-mng-policies-pipeline
+        RoleArn: !GetAtt CodePipelineRole.Arn
+        ArtifactStore:
+          Type: S3
+          Location: !Ref CxMgrartifactsBucket
+        PipelineType: V2
+        Stages:
+          - Name: Source
+            Actions:
+              - Name: Source
+                InputArtifacts: []
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: '1'
+                  Provider: CodeStarSourceConnection
+                Configuration:
+                  ConnectionArn: !If [ CreateCodeStarConnectionGitHub, !GetAtt CodeStarConnectionGitHub.ConnectionArn, !GetAtt CodeStarConnectionGitLab.ConnectionArn ]
+                  FullRepositoryId: !Sub ${RepositoryOwner}/${RepositoryName}
+                  BranchName: "main"
+                RunOrder: 1
+                OutputArtifacts:
+                  - Name: SourceOutput
 
-        - Name: TemplateValidation
-          Actions:
-            - Name: TemplateValidation
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Provider: CodeBuild
-                Version: '1'
-              Configuration:
-                ProjectName: !Ref TemplateValidationCodeBuildProject
-              RunOrder: 1
-              InputArtifacts:
-                - Name: SourceOutput
-              OutputArtifacts:
-                - Name: TemplateValidationOutput
+          - Name: TemplateValidation
+            Actions:
+              - Name: TemplateValidation
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref TemplateValidationCodeBuildProject
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: SourceOutput
+                OutputArtifacts:
+                  - Name: TemplateValidationOutput
 
-        - Name: CustomerManagedPolicies
-          Actions:
-            - Name: CustomerManagedPolicies
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Provider: CodeBuild
-                Version: '1'
-              Configuration:
-                ProjectName: !Ref CustomerManagedPoliciesCodeBuildProject
-              RunOrder: 1
-              InputArtifacts:
-                - Name: TemplateValidationOutput
-              OutputArtifacts:
-                - Name: CustomerManagedPoliciesOutput
+          - Name: CustomerManagedPolicies
+            Actions:
+              - Name: CustomerManagedPolicies
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref CustomerManagedPoliciesCodeBuildProject
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: TemplateValidationOutput
+                OutputArtifacts:
+                  - Name: CustomerManagedPoliciesOutput
 
-        - Name: Assignments
-          Actions:
-            - Name: Assignments
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Provider: CodeBuild
-                Version: '1'
-              Configuration:
-                ProjectName: !Ref AssignmentsCodeBuildProject
-                PrimarySource: Source
-              RunOrder: 1
-              InputArtifacts:
-                - Name: CustomerManagedPoliciesOutput
-              OutputArtifacts:
-                - Name: AssignmentsOutput
-      Triggers:
-        - ProviderType: CodeStarSourceConnection
-          GitConfiguration:
-            SourceActionName: Source
-            Push:
-                 - Branches:
-                        Includes:
-                             - main
+          - Name: Assignments
+            Actions:
+              - Name: Assignments
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref AssignmentsCodeBuildProject
+                  PrimarySource: Source
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: CustomerManagedPoliciesOutput
+                OutputArtifacts:
+                  - Name: AssignmentsOutput
+        Triggers:
+          - ProviderType: CodeStarSourceConnection
+            GitConfiguration:
+              SourceActionName: Source
+              Push:
+                  - Branches:
+                          Includes:
+                              - main
 
-## +-------------------------------+ ##
-## | Create the CodePipeline Role  | ##
-## +-------------------------------+ ##
+  ## +-------------------------------+ ##
+  ## | Create the CodePipeline Role  | ##
+  ## +-------------------------------+ ##
 
-  CodePipelineRole:
-    Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: The IAM permissions associate is under review.
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - codepipeline.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: CodePipelinePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - codebuild:StartBuild
-                  - codebuild:BatchGetBuilds
-                  - codebuild:StopBuild
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - codecommit:GitPull
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - codestar-connections:UseConnection
-                  - codestar-connections:PassConnection
-                Resource: !If [ CreateCodeStarConnectionGitHub, !GetAtt CodeStarConnectionGitHub.ConnectionArn, !GetAtt CodeStarConnectionGitLab.ConnectionArn ]
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetBucketPolicy
-                  - s3:GetObject
-                  - s3:GetBucketAcl
-                  - s3:GetBucketLocation
-                Resource: 
-                  - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}*'
-                  - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
-                Condition:
-                  StringEquals:
-                    "s3:ResourceAccount": !Ref "AWS::AccountId"
+    CodePipelineRole:
+      Type: AWS::IAM::Role
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: The IAM permissions associate is under review.
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codepipeline.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CodePipelinePolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - codebuild:StartBuild
+                    - codebuild:BatchGetBuilds
+                    - codebuild:StopBuild
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - codecommit:GitPull
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - codestar-connections:UseConnection
+                    - codestar-connections:PassConnection
+                  Resource: !If [ CreateCodeStarConnectionGitHub, !GetAtt CodeStarConnectionGitHub.ConnectionArn, !GetAtt CodeStarConnectionGitLab.ConnectionArn ]
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetBucketPolicy
+                    - s3:GetObject
+                    - s3:GetBucketAcl
+                    - s3:GetBucketLocation
+                  Resource: 
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}*'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                  Condition:
+                    StringEquals:
+                      "s3:ResourceAccount": !Ref "AWS::AccountId"
