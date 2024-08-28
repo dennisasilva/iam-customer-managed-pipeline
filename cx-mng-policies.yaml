@@ -102,7 +102,7 @@ Resources:
       RepositoryOwner: !Ref RepositoryOwner
 
 ## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create the CodeBuild for stages: Source, Template Validation, Customer Managed Policies and Assignments
+## | Create the CodeBuild for stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
 ## +---------------------------------------------------------------------------------------------------------+ ##
 
   TemplateValidationCodeBuildProject:
@@ -165,9 +165,9 @@ Resources:
         Type: CODEPIPELINE
         BuildSpec: codebuild/assignments/buildspec.yaml
   
-## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create the CodeBuild role for TemplateValidationCodeBuildProject project
-## +---------------------------------------------------------------------------------------------------------+ ##
+## +--------------------------------------------------------------------------+ ##
+## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
+## +--------------------------------------------------------------------------+ ##
   CodeBuildRoleTemplateValidation:
     Type: AWS::IAM::Role
     Metadata:
@@ -200,9 +200,9 @@ Resources:
                   - codecommit:GitPull
                 Resource: "*"
 
-## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create the CodeBuild role for CustomerManagedPoliciesCodeBuildProject project
-## +---------------------------------------------------------------------------------------------------------+ ##
+## +-------------------------------------------------------------------------------+ ##
+## | Create the CodeBuild role for CustomerManagedPoliciesCodeBuildProject project | ##
+## +-------------------------------------------------------------------------------+ ##
   
   CodeBuildRoleCustomerManagedPolicies:
     Type: AWS::IAM::Role
@@ -242,9 +242,9 @@ Resources:
                   - s3:ListBucket
                 Resource: "*"
 
-## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create the CodeBuild role for AssignmentsCodeBuildProject project
-## +---------------------------------------------------------------------------------------------------------+ ##
+## +-------------------------------------------------------------------+ ##
+## | Create the CodeBuild role for AssignmentsCodeBuildProject project | ##
+## +-------------------------------------------------------------------+ ##
   
   CodeBuildRoleAssignments:
     Type: AWS::IAM::Role
@@ -288,9 +288,9 @@ Resources:
                   - sts:AssumeRole
                 Resource: "*"
 
-## +---------------
-## | S3 Bucket Artifact 
-## +---------------
+## +--------------------+ ##
+## | S3 Bucket Artifact | ##
+## +--------------------+ ##
   CxMgrartifactsBucket:
     Type: 'AWS::S3::Bucket'    
     Metadata:
@@ -332,9 +332,9 @@ Resources:
               Bool:
                 aws:SecureTransport: false
 
-## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create a CodePipeline with stages: Source, Template Validation, Customer Managed Policies and Assignments
-## +---------------------------------------------------------------------------------------------------------+ ##
+## +-----------------------------------------------------------------------------------------------------------+ ##
+## | Create a CodePipeline with stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
+## +-----------------------------------------------------------------------------------------------------------+ ##
 
   CodePipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -420,9 +420,9 @@ Resources:
                         Includes:
                              - main
 
-## +---------------------------------------------------------------------------------------------------------+ ##
-## | Create the CodePipeline Role
-## +---------------------------------------------------------------------------------------------------------+ ##
+## +-------------------------------+ ##
+## | Create the CodePipeline Role  | ##
+## +-------------------------------+ ##
 
   CodePipelineRole:
     Type: AWS::IAM::Role
