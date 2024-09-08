@@ -115,15 +115,30 @@
       Properties:
         Name: !Sub ${AWS::StackName}-template-validation
         ServiceRole: !GetAtt CodeBuildRoleTemplateValidation.Arn
-        Artifacts:
-          Type: CODEPIPELINE
         Environment:
           Type: LINUX_CONTAINER
           ComputeType: BUILD_GENERAL1_SMALL
           Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+          EnvironmentVariables:
+            - Name: REGION
+              Value: !Sub ${AWS::Region}
+        Artifacts:
+          Type: CODEPIPELINE
+        TimeoutInMinutes: 480
         Source:
           Type: CODEPIPELINE
-          BuildSpec: codebuild/template-validation/buildspec.yaml
+          BuildSpec: |
+            version: 0.2
+            phases:
+              build:
+                commands:
+                  - echo "[INFO] [BUILD] Starting template validation process"
+                  - cd source/validation/
+                  - chmod +x customer-managed-validation.py
+                  - python3 customer-managed-validation.py --policies-folder '../../templates/customer-managed-policies/' --assignments-folder '../../templates/assignments/'
+        Tags:
+          - Key: "Name"
+            Value: "Template-Validation-CodeBuild-Project"
 
     CustomerManagedPoliciesCodeBuildProject:
       Type: AWS::CodeBuild::Project
@@ -135,15 +150,29 @@
       Properties:
         Name: !Sub ${AWS::StackName}-customer-managed-policies
         ServiceRole: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
-        Artifacts:
-          Type: CODEPIPELINE
         Environment:
           Type: LINUX_CONTAINER
           ComputeType: BUILD_GENERAL1_SMALL
           Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+          EnvironmentVariables:
+            - Name: REGION
+              Value: !Sub ${AWS::Region}
+        Artifacts:
+          Type: CODEPIPELINE
         Source:
           Type: CODEPIPELINE
-          BuildSpec: codebuild/customer-managed-policies/buildspec.yaml
+          BuildSpec: |
+            version: 0.2
+            phases:
+              build:
+                commands:
+                  - echo "[INFO] [BUILD] Starting Customer Managed Policies process"
+                  - cd source/customer-managed-policies/
+                  - chmod +x customer-managed-deploy.py
+                  - python3 customer-managed-policies.py
+        Tags:
+            - Key: "Name"
+              Value: "Customer-Managed-Policies-CodeBuild-Project"
 
     AssignmentsCodeBuildProject:
       Type: AWS::CodeBuild::Project
@@ -198,6 +227,12 @@
                 - Effect: Allow
                   Action:
                     - codecommit:GitPull
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
                   Resource: "*"
 
   ## +-------------------------------------------------------------------------------+ ##
