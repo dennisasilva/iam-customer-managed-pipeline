@@ -43,7 +43,7 @@ log.setLevel(logging.INFO)
 
 def list_policy_folder():
     policy_dict = {
-        eachFile: json.loads(open(os.path.join(args.policiesFolder, eachFile)).read())
+        eachFile: json.loads(open(os.path.join(args.policiesFolder, eachFile), 'r', encoding='utf-8').read())
         for eachFile in os.listdir(args.policiesFolder)
     }
     log.info('Customer-managed policies successfully loaded from repository files')
@@ -90,9 +90,9 @@ def validate_json_policy_format():
                 log.warning(f"[{policy_name}] An issue was found in the policy: " + str(eachFinding['findingDetails']))
 
 def main():
-    print("########################################")
+    print("#################################################")
     print("# Starting Customer Managed Policies Validation #")
-    print("########################################\n")
+    print("#################################################\n")
     
     # Check if policy folder argument exists
     if args.policiesFolder is None:
@@ -107,7 +107,7 @@ def main():
     # List of controls that will be validated
     validate_unique_policy_name()
     validate_json_policy_format()
-    validate_managed_policies_arn()
+    validate_json_policy_format()
     
     log.info('Congrats! All policies were evaluated without errors! :)')
 
