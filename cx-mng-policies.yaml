@@ -169,7 +169,7 @@
                   - echo "[INFO] [BUILD] Starting Customer Managed Policies process"
                   - cd source/customer-managed-policies/
                   - chmod +x customer-managed-deploy.py
-                  - python3 customer-managed-policies.py
+                  - python3 customer-managed-deploy.py
         Tags:
             - Key: "Name"
               Value: "Customer-Managed-Policies-CodeBuild-Project"
