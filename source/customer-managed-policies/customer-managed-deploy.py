@@ -17,6 +17,7 @@ import boto3
 import json
 import os
 import logging
+import botocore
 from botocore.config import Config
 
 # Logging configuration
