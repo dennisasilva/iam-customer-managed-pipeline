@@ -427,7 +427,7 @@
                   ProjectName: !Ref CustomerManagedPoliciesCodeBuildProject
                 RunOrder: 1
                 InputArtifacts:
-                  - Name: TemplateValidationOutput
+                  - Name: SourceOutput
                 OutputArtifacts:
                   - Name: CustomerManagedPoliciesOutput
 
@@ -444,7 +444,7 @@
                   PrimarySource: Source
                 RunOrder: 1
                 InputArtifacts:
-                  - Name: CustomerManagedPoliciesOutput
+                  - Name: SourceOutput
                 OutputArtifacts:
                   - Name: AssignmentsOutput
         Triggers:
