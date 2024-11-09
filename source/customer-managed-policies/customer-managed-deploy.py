@@ -47,9 +47,12 @@ def get_current_customer_managed_policies():
         response = client.list_policies(Scope='Local', OnlyAttached=False, Marker=response["Marker"])
         policies.extend(response["Policies"])
 
-    for policy in policies:
-        policies_dict[policy["PolicyName"]] = policy["Arn"]
-
+    for data in some_data_source:
+        if 'PolicyName' in data:
+            policies_dict[data['PolicyName']] = data
+        else:
+            # Log ou mensagem para indicar que o PolicyName está ausente
+            print(f"Warning: 'PolicyName' not found in {data}")
     return policies_dict
 
 # This method will return all customer managed policies in the specified folder
