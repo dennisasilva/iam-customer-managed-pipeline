@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  AccountNumber:
+    Type: String
+    Description: "The AWS account number to be used in the trust policy."
+
+Resources:
+  DeployCustomerManagedPolicyRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "deploy-customer-managed-policy"
+      Description: "This role allows CodeBuild to deploy AWS IAM customer managed policies."
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AccountNumber}:role/cx-mng-pipeline-customer-managed-policies"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "customer-managed-policy-pipeline"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "VisualEditor0"
+                Effect: "Allow"
+                Action:
+                  - "iam:CreatePolicy"
+                  - "iam:ListPolicies"
+                  - "iam:GetPolicyVersion"
+                  - "iam:GetPolicy"
+                  - "iam:ListPolicyVersions"
+                  - "iam:UntagPolicy"
+                  - "iam:DeletePolicy"
+                  - "iam:ListPolicyTags"
+                  - "iam:CreatePolicyVersion"
+                  - "iam:TagPolicy"
+                  - "iam:DeletePolicyVersion"
+                Resource: "*"
