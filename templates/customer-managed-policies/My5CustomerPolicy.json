@@ -1,0 +1,28 @@
+{
+  "PolicyName": "My5CustomerPolicy",
+  "Description": "This is the 5th customer managed policy created by Pipeline",
+  "Path": "/customer1/",
+  "PolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "5ndPolicy",
+        "Action": [
+          "fis:*"
+        ],
+        "Effect": "Allow",
+        "Resource": "*"
+      }
+    ]
+  },
+  "Tags": [
+    {
+      "Key": "department",
+      "Value": "IT"
+    },
+    {
+      "Key": "cost-center",
+      "Value": "11332"
+    }
+  ]
+}

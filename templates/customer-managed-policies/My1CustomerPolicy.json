@@ -1,0 +1,23 @@
+{
+  "PolicyName": "MyFirstCustomerPolicy",
+  "Description" : "This is the first customer managed policy created by Pipeline",
+  "Path": "/",
+  "PolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [     
+            {
+                "Sid": "CustomPolicy",
+                "Action": [
+                    "ec2:*SecurityGroup*",
+                    "ec2:*NetworkAcl*",
+                    "ec2:*Snapshot*",
+                    "ec2:*InstanceProfile*",
+                    "ec2:*Permission*"
+                ],
+              "Effect": "Allow",
+              "Resource": "*"
+            }
+        ]
+    },
+  "Tags": []
+}

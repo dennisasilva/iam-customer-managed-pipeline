@@ -1,0 +1,22 @@
+{
+  "PolicyName": "My2CustomerPolicy",
+  "Description" : "This is the 2nd customer managed policy created by Pipeline",
+  "Path": "/",
+  "PolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [     
+            {
+                "Sid": "2ndPolicy",
+                "Action": [
+                    "s3:*",
+                    "ec2:*",
+                    "iam:*",
+                    "cloudfront:*"
+                ],
+              "Effect": "Allow",
+              "Resource": "*"
+            }
+        ]
+    },
+  "Tags": []
+}

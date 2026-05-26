@@ -1,0 +1,29 @@
+{
+    "Assignments": [
+        {
+            "SID": "MyFirstPolicy",
+            "Target": [
+                "111111111111",
+                "222222222222",
+                "444444444444"
+            ],
+            "CustomerManagedPolicyName": [
+                "My1CustomerPolicy",
+                "My2CustomerPolicy",
+                "My3CustomerPolicy"
+            ]
+        },
+        {
+            "SID": "2Part",
+            "Target": [
+                "555555555555",
+                "666666666666"
+            ],
+            "CustomerManagedPolicyName": [
+                "My4CustomerPolicy",
+                "My5CustomerPolicy"
+            ]
+        }
+    ]
+}
+

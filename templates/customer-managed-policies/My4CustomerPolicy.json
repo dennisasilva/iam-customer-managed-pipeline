@@ -1,0 +1,28 @@
+{
+  "PolicyName": "My4CustomerPolicy",
+  "Description": "This is the 4th customer managed policy created by Pipeline",
+  "Path": "/",
+  "PolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "4ndPolicy",
+        "Action": [
+          "fis:*"
+        ],
+        "Effect": "Allow",
+        "Resource": "*"
+      }
+    ]
+  },
+  "Tags": [
+    {
+      "Key": "department",
+      "Value": "human-resource"
+    },
+    {
+      "Key": "cost-center",
+      "Value": "11223"
+    }
+  ]
+}

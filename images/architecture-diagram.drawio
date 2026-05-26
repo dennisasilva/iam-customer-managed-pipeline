@@ -1,0 +1,103 @@
+<mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+    <mxCell id="title" value="IAM Customer Managed Policies Pipeline - Architecture" style="text;html=1;fontSize=18;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="400" y="20" width="500" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="github" value="GitHub Repository" style="shape=mxgraph.signs.tech.computer_2;whiteSpace=wrap;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="40" y="160" width="100" height="80" as="geometry"/>
+    </mxCell>
+    <mxCell id="codestar" value="CodeStar Connection" style="rounded=1;whiteSpace=wrap;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="200" y="175" width="100" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="pipeline_container" value="CodePipeline: cx-mng-policies-pipeline (Account 111111111111)" style="swimlane;startSize=30;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;container=1;pointerEvents=0;" vertex="1" parent="1">
+      <mxGeometry x="360" y="80" width="1180" height="280" as="geometry"/>
+    </mxCell>
+    <mxCell id="source" value="Source" style="rounded=1;whiteSpace=wrap;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="20" y="50" width="120" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="validation" value="Template Validation" style="rounded=1;whiteSpace=wrap;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="180" y="50" width="120" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="rolevalidation" value="Role Validation" style="rounded=1;whiteSpace=wrap;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="340" y="50" width="120" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="dryrun" value="DryRun" style="rounded=1;whiteSpace=wrap;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;fontStyle=1;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="500" y="50" width="120" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="approval" value="Approval (Manual)" style="rounded=1;whiteSpace=wrap;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;fontStyle=1;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="660" y="50" width="120" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="deploy" value="Customer Managed Policies" style="rounded=1;whiteSpace=wrap;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="820" y="50" width="140" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="e1" edge="1" parent="pipeline_container" source="source" target="validation" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e2" edge="1" parent="pipeline_container" source="validation" target="rolevalidation" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e3" edge="1" parent="pipeline_container" source="rolevalidation" target="dryrun" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e4" edge="1" parent="pipeline_container" source="dryrun" target="approval" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e5" edge="1" parent="pipeline_container" source="approval" target="deploy" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="s3state" value="S3 Bucket (State + Artifacts)" style="shape=cylinder3;whiteSpace=wrap;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="pipeline_container">
+      <mxGeometry x="680" y="190" width="130" height="70" as="geometry"/>
+    </mxCell>
+    <mxCell id="es1" edge="1" parent="pipeline_container" source="dryrun" target="s3state" style="edgeStyle=orthogonalEdgeStyle;rounded=1;dashed=1;" value="read state">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="es2" edge="1" parent="pipeline_container" source="deploy" target="s3state" style="edgeStyle=orthogonalEdgeStyle;rounded=1;dashed=1;" value="read/write state">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="eg" edge="1" parent="1" source="github" target="codestar" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="ec" edge="1" parent="1" source="codestar" target="source" style="edgeStyle=orthogonalEdgeStyle;rounded=1;">
+      <mxGeometry relative="1" as="geometry">
+        <mxPoint x="380" y="155" as="targetPoint"/>
+      </mxGeometry>
+    </mxCell>
+    <mxCell id="target_container" value="Target AWS Accounts (StackSet auto-deploy on OU)" style="swimlane;startSize=30;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1;container=1;pointerEvents=0;" vertex="1" parent="1">
+      <mxGeometry x="360" y="420" width="800" height="160" as="geometry"/>
+    </mxCell>
+    <mxCell id="acc1" value="Account A" style="rounded=1;whiteSpace=wrap;fillColor=#f5f5f5;strokeColor=#666666;fontSize=10;" vertex="1" parent="target_container">
+      <mxGeometry x="30" y="50" width="130" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="acc2" value="Account B" style="rounded=1;whiteSpace=wrap;fillColor=#f5f5f5;strokeColor=#666666;fontSize=10;" vertex="1" parent="target_container">
+      <mxGeometry x="200" y="50" width="130" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="acc3" value="Account C" style="rounded=1;whiteSpace=wrap;fillColor=#f5f5f5;strokeColor=#666666;fontSize=10;" vertex="1" parent="target_container">
+      <mxGeometry x="370" y="50" width="130" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="accn" value="Account N (auto)" style="rounded=1;whiteSpace=wrap;fillColor=#f5f5f5;strokeColor=#666666;fontSize=10;dashed=1;" vertex="1" parent="target_container">
+      <mxGeometry x="540" y="50" width="130" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="role1" value="deploy-customer-managed-policy" style="rounded=1;whiteSpace=wrap;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" vertex="1" parent="target_container">
+      <mxGeometry x="30" y="105" width="130" height="35" as="geometry"/>
+    </mxCell>
+    <mxCell id="role2" value="deploy-customer-managed-policy" style="rounded=1;whiteSpace=wrap;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" vertex="1" parent="target_container">
+      <mxGeometry x="200" y="105" width="130" height="35" as="geometry"/>
+    </mxCell>
+    <mxCell id="role3" value="deploy-customer-managed-policy" style="rounded=1;whiteSpace=wrap;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" vertex="1" parent="target_container">
+      <mxGeometry x="370" y="105" width="130" height="35" as="geometry"/>
+    </mxCell>
+    <mxCell id="rolen" value="deploy-customer-managed-policy" style="rounded=1;whiteSpace=wrap;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;dashed=1;" vertex="1" parent="target_container">
+      <mxGeometry x="540" y="105" width="130" height="35" as="geometry"/>
+    </mxCell>
+    <mxCell id="assume_arrow" value="sts:AssumeRole" style="edgeStyle=orthogonalEdgeStyle;rounded=1;fontStyle=1;fontSize=10;" edge="1" parent="1" source="deploy" target="target_container">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="1250" y="390"/>
+          <mxPoint x="760" y="390"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+  </root>
+</mxGraphModel>
