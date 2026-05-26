@@ -1,6 +1,6 @@
 {
-  "PolicyName": "MyFirstCustomerPolicy",
-  "Description" : "This is the first customer managed policy created by Pipeline",
+  "PolicyName": "My1CustomerPolicy",
+  "Description": "This is the first customer managed policy created by Pipeline",
   "Path": "/",
   "PolicyDocument": {
         "Version": "2012-10-17",
