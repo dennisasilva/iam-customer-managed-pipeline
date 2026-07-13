@@ -30,6 +30,72 @@ flowchart LR
     class Repo,IAM,S3 store;
 ```
 
+## Arquitetura AWS Detalhada
+
+O diagrama de sequência abaixo detalha, passo a passo, as interações entre os serviços AWS ao longo dos estágios do pipeline — do `git push` do desenvolvedor até a criação/atualização das políticas nas contas-alvo, com o state versionado no S3.
+
+```mermaid
+sequenceDiagram
+    participant Dev as 👤 Desenvolvedor
+    participant GH as 🐙 GitHub
+    participant CP as 🔀 CodePipeline (V2)
+    participant TV as ⚡ CodeBuild: TemplateValidation
+    participant AA as 🔎 IAM Access Analyzer
+    participant RV as ⚡ CodeBuild: RoleValidation
+    participant DR as ⚡ CodeBuild: DryRun
+    participant OP as 👤 Aprovador
+    participant CMP as ⚡ CodeBuild: CustomerManagedPolicies
+    participant STS as 🔐 AWS STS
+    participant Role as 🛡️ Role deploy (conta-alvo)
+    participant IAM as 📜 IAM (conta-alvo)
+    participant S3 as 🪣 S3: Artefatos + State
+    participant CW as 📊 CloudWatch Logs
+
+    Note over Dev,CW: Pipeline de IAM Customer Managed Policies (GitOps)
+
+    Dev->>GH: 1. git push (branch main)
+    GH->>CP: 2. CodeStar Connection dispara o pipeline
+    CP->>S3: 3. Source: baixa o código (SourceOutput)
+
+    Note over TV,AA: Estágio TemplateValidation
+    CP->>TV: 4. inicia
+    TV->>TV: 5. valida JSON, PolicyName único, Path, Account IDs
+    TV->>AA: 6. validate_policy (boas práticas)
+    AA-->>TV: findings (ERROR falha o build)
+    TV->>CW: logs
+    TV-->>CP: OK
+
+    Note over RV,Role: Estágio RoleValidation
+    CP->>RV: 7. inicia
+    RV->>STS: 8. AssumeRole + ExternalId (cada conta-alvo)
+    STS-->>RV: credenciais temporárias
+    RV->>Role: 9. iam:GetRole (confirma que a role existe)
+    Role-->>RV: ok
+    RV-->>CP: OK (falha cedo se faltar a role)
+
+    Note over DR,S3: Estágio DryRun
+    CP->>DR: 10. inicia (--dry-run)
+    DR->>S3: 11. lê state/&lt;account&gt;.json
+    DR->>DR: 12. calcula o diff (sem mutar nada)
+    DR-->>CP: OK
+
+    opt ManualApproval = true
+        CP->>OP: 13. aprovação manual
+        OP-->>CP: aprova (após revisar os logs do DryRun)
+    end
+
+    Note over CMP,IAM: Estágio CustomerManagedPolicies
+    CP->>CMP: 14. inicia o deploy
+    CMP->>STS: 15. AssumeRole + ExternalId (conta-alvo)
+    STS-->>CMP: credenciais temporárias
+    CMP->>IAM: 16. Create/Update/Delete policies (tag cx-mng:true)
+    IAM-->>CMP: aplicado (cap de 5 versões gerido)
+    CMP->>S3: 17. grava state/&lt;account&gt;.json
+    CMP-->>CP: concluído
+
+    Note over Dev,CW: ✅ Políticas sincronizadas nas contas-alvo; state versionado no S3
+```
+
 ## Pré-requisitos
 
 ### 1. GitHub Fine-Grained Personal Access Token
