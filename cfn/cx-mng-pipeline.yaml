@@ -1,3 +1,4 @@
+  # SPDX-License-Identifier: MIT
   # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
   # Permission is hereby granted, free of charge, to any person obtaining a copy of this
@@ -34,31 +35,82 @@
       Description: 'S3 bucket with the initial repository code. Must be created in advance.'
       Type: String
       Default: 'iam-cx-mng-pipeline-initialcode'
+      MinLength: 3
+      MaxLength: 63
+      AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+      ConstraintDescription: 'Bucket name must be 3-63 chars, lowercase letters, numbers, dots and hyphens; must start and end with a letter or number.'
 
     S3BucketCodeKey:
       Description: 'Name of the zip file with the repository initial code hosted in S3 bucket above'
       Type: String
       Default: 'iam-cx-mng-pipeline.zip'
+      MinLength: 5
+      MaxLength: 1024
+      AllowedPattern: '^[A-Za-z0-9._/-]+\.zip$'
+      ConstraintDescription: 'S3 key must end with .zip and contain only letters, numbers, dots, underscores, slashes and hyphens.'
 
     RepositoryName:
-      Description: 'Name of the GitHub reposiroty'
+      Description: 'Name of the GitHub repository'
       Type: String
       Default: 'iam-cx-mng-pipeline'
+      MinLength: 1
+      MaxLength: 100
+      AllowedPattern: '^[A-Za-z0-9._-]+$'
+      ConstraintDescription: 'Repository name must contain only letters, numbers, dots, underscores and hyphens (max 100 chars).'
 
     RepositoryOwner:
-      Description: 'Username Github Owner'
+      Description: 'Username GitHub Owner'
       Type: String
       Default: 'dennisasilva'
+      MinLength: 1
+      MaxLength: 39
+      AllowedPattern: '^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$'
+      ConstraintDescription: 'GitHub username (1-39 chars): alphanumeric and hyphens; cannot start/end with hyphen or have consecutive hyphens.'
+
+    BranchName:
+      Description: 'Branch name to track in the source repository (e.g. main, master, develop)'
+      Type: String
+      Default: 'main'
+      MinLength: 1
+      MaxLength: 250
+      AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._/-]*$'
+      ConstraintDescription: 'Branch name must start with a letter or digit and contain only letters, numbers, dots, underscores, slashes and hyphens.'
 
     SecretId:
-      Description: 'Insert the secret name value here'
+      Description: 'Name of the AWS Secrets Manager secret holding the Git provider personal access token'
       Type: String
       Default: 'dev/cx-mgn-pipe/github'
+      NoEcho: true
+      MinLength: 1
+      MaxLength: 512
+      AllowedPattern: '^[A-Za-z0-9/_+=.@-]+$'
+      ConstraintDescription: 'Secret name must contain only letters, numbers, and the characters / _ + = . @ -'
+
+    ExternalId:
+      Description: 'Shared secret used when assuming the cross-account deploy role. Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+      Type: String
+      NoEcho: true
+      MinLength: 16
+      MaxLength: 64
+      AllowedPattern: '^[A-Za-z0-9_-]+$'
+      ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
 
     NamingConvention:
-      Description: 'Insert the naming convention value here'
+      Description: 'Prefix used in IAM role/CodeBuild names. Limited to 30 chars so role names fit the IAM 64-char limit (longest suffix is "-customer-managed-policies").'
       Type: String
       Default: 'cx-mng-pipeline'
+      MinLength: 2
+      MaxLength: 30
+      AllowedPattern: '^[a-z]([a-z0-9-]*[a-z0-9])?$'
+      ConstraintDescription: 'Must be lowercase, start with a letter, end with a letter or number, contain only letters/numbers/hyphens (2-30 chars).'
+
+    ManualApproval:
+      Description: 'Enable manual approval stage before deploying customer managed policies'
+      Type: String
+      AllowedValues:
+        - 'true'
+        - 'false'
+      Default: 'true'
 
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
@@ -67,6 +119,7 @@
   Conditions:
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
+    cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
 
   Resources:
 
@@ -125,6 +178,8 @@
           ComputeType: BUILD_GENERAL1_SMALL
           Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
           EnvironmentVariables:
+            - Name: TZ
+              Value: America/Sao_Paulo
             - Name: REGION
               Value: !Sub ${AWS::Region}
         Artifacts:
@@ -160,8 +215,14 @@
           ComputeType: BUILD_GENERAL1_SMALL
           Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
           EnvironmentVariables:
+            - Name: TZ
+              Value: America/Sao_Paulo
             - Name: REGION
               Value: !Sub ${AWS::Region}
+            - Name: STATE_BUCKET
+              Value: !Ref CxMgrartifactsBucket
+            - Name: EXTERNAL_ID
+              Value: !Ref ExternalId
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -174,11 +235,54 @@
                   - echo "[INFO] [BUILD] Starting Customer Managed Policies process"
                   - cd source/customer-managed-policies/
                   - chmod +x customer-managed-deploy.py
-                  - python3 customer-managed-deploy.py
+                  - python3 customer-managed-deploy.py --state-bucket $STATE_BUCKET
         Tags:
             - Key: "Name"
               Value: "Customer-Managed-Policies-CodeBuild-Project"
     
+  ## +--------------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild for DryRun project                                | ##
+  ## +--------------------------------------------------------------------------+ ##
+
+    DryRunCodeBuildProject:
+      Type: AWS::CodeBuild::Project
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W32
+              reason: The CodeBuild is going to use the AWS Managed key.
+      Properties:
+        Name: !Sub "${NamingConvention}-dry-run"
+        ServiceRole: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
+        Environment:
+          Type: LINUX_CONTAINER
+          ComputeType: BUILD_GENERAL1_SMALL
+          Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+          EnvironmentVariables:
+            - Name: TZ
+              Value: America/Sao_Paulo
+            - Name: STATE_BUCKET
+              Value: !Ref CxMgrartifactsBucket
+            - Name: EXTERNAL_ID
+              Value: !Ref ExternalId
+        Artifacts:
+          Type: CODEPIPELINE
+        TimeoutInMinutes: 480
+        Source:
+          Type: CODEPIPELINE
+          BuildSpec: |
+            version: 0.2
+            phases:
+              build:
+                commands:
+                  - echo "[INFO] [BUILD] Starting dry-run process"
+                  - cd source/customer-managed-policies/
+                  - chmod +x customer-managed-deploy.py
+                  - python3 customer-managed-deploy.py --dry-run --state-bucket $STATE_BUCKET
+        Tags:
+          - Key: "Name"
+            Value: "DryRun-CodeBuild-Project"
+
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild for RoleValidation project                        | ##
   ## +--------------------------------------------------------------------------+ ##
@@ -197,6 +301,11 @@
           Type: LINUX_CONTAINER
           ComputeType: BUILD_GENERAL1_SMALL
           Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+          EnvironmentVariables:
+            - Name: TZ
+              Value: America/Sao_Paulo
+            - Name: EXTERNAL_ID
+              Value: !Ref ExternalId
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -256,7 +365,21 @@
                     - s3:GetObject
                     - s3:PutObject
                     - s3:ListBucket
-                  Resource: "*"
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Required because the artifact bucket is encrypted with
+                  # SSE-KMS (alias/aws/s3). The kms:ViaService condition
+                  # restricts these permissions to KMS calls made by S3 in
+                  # this region only.
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
                 - Effect: Allow
                   Action:
                     - sts:AssumeRole
@@ -299,15 +422,25 @@
                   Resource: "*"
                 - Effect: Allow
                   Action:
-                    - codecommit:GitPull
-                  Resource: "*"
-                - Effect: Allow
-                  Action:
                     - s3:GetObject
                     - s3:PutObject
                     - s3:ListBucket
                     - s3:AbortMultipartUpload
-                  Resource: "*"
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Required because the artifact bucket is encrypted with
+                  # SSE-KMS (alias/aws/s3). The kms:ViaService condition
+                  # restricts these permissions to KMS calls made by S3 in
+                  # this region only.
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
 
   ## +-------------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for CustomerManagedPoliciesCodeBuildProject project | ##
@@ -347,14 +480,24 @@
                   Resource: "*"
                 - Effect: Allow
                   Action:
-                    - codecommit:GitPull
-                  Resource: "*"
-                - Effect: Allow
-                  Action:
                     - s3:GetObject
                     - s3:PutObject
                     - s3:ListBucket
-                  Resource: "*"
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Required because the artifact bucket is encrypted with
+                  # SSE-KMS (alias/aws/s3). The kms:ViaService condition
+                  # restricts these permissions to KMS calls made by S3 in
+                  # this region only.
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
                 - Effect: Allow
                   Action:
                     - sts:AssumeRole
@@ -397,10 +540,6 @@
                   Resource: "*"
                 - Effect: Allow
                   Action:
-                    - codecommit:GitPull
-                  Resource: "*"
-                - Effect: Allow
-                  Action:
                     - logs:CreateLogGroup
                     - logs:CreateLogStream
                     - logs:PutLogEvents
@@ -423,6 +562,18 @@
                   Condition:
                     StringEquals:
                       "s3:ResourceAccount": !Ref "AWS::AccountId"
+                - Effect: Allow
+                  # Required because the artifact bucket is encrypted with
+                  # SSE-KMS (alias/aws/s3). The kms:ViaService condition
+                  # restricts these permissions to KMS calls made by S3 in
+                  # this region only.
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
 
   ## +--------------------+ ##
   ## | S3 Bucket Artifact | ##
@@ -433,15 +584,62 @@
         cfn_nag:
           rules_to_suppress:
             - id: W35
-              reason: "There is no need to enable log in this bucket."            
+              reason: "There is no need to enable log in this bucket."
+            - id: W41
+              reason: >
+                Encryption is enabled via SSE-KMS using the AWS Managed key
+                (alias/aws/s3). A customer-managed CMK was deliberately not
+                created to avoid the recurring KMS key fee and the management
+                overhead. Trade-off: less granular auditability and revocability,
+                acceptable for operational state (no PII / secrets stored here).
+        SecurityDecisions:
+          Encryption: |
+            SSE-KMS with the AWS Managed key alias/aws/s3.
+            Reasons for choosing AWS Managed over a Customer Managed CMK:
+              * No monthly key fee (~$1) and no per-key infrastructure to manage.
+              * Bucket only stores pipeline artifacts and policy state files
+                (hash + ARN + timestamp); no secrets or PII.
+              * Versioning + BlockPublicAccess + HTTPS-only bucket policy
+                already provide the data integrity / confidentiality controls
+                this workload needs.
+            If audit-per-key, revocability or cross-account sharing become
+            requirements, replace this with an AWS::KMS::Key resource and
+            update the BucketEncryption block to reference its alias.
+          Ownership: |
+            BucketOwnerEnforced — ACLs are disabled bucket-wide. Any object
+            written to this bucket is automatically owned by the bucket owner.
+            All access control is centralized on the bucket policy + IAM,
+            removing the legacy per-object ACL surface.
+          Retention: |
+            Lifecycle rules separate two distinct content domains by prefix:
+              * '<NamingConvention>-pipeline/'  — CodePipeline-managed
+                artifacts (SourceOutput zips, build outputs). Current version
+                expires after 90 days; noncurrent versions after 30 days.
+              * 'state/'                        — state files used by the
+                deploy script for drift detection. Current version NEVER
+                expires (no ExpirationInDays). Noncurrent versions kept 365
+                days for forensic history.
+            The two prefixes are disjoint by construction, so the rules never
+            overlap. Anything written to the bucket outside these prefixes is
+            preserved indefinitely (intentional — likely operator action).
+            Both rules also clean up incomplete multipart uploads after 7 days.
       Properties:
         BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-cx-mng-artfcs
+        OwnershipControls:
+          Rules:
+            # ACLs disabled bucket-wide; bucket owner is always object owner.
+            # AWS-recommended default since April 2023 for new buckets.
+            - ObjectOwnership: BucketOwnerEnforced
         VersioningConfiguration:
           Status: Enabled
         BucketEncryption:
           ServerSideEncryptionConfiguration:
+            # SSE-KMS with the AWS Managed key (alias/aws/s3).
+            # No KMSMasterKeyID is set on purpose — that delegates the key
+            # choice to S3, which uses the account-wide aws/s3 managed key.
+            # See Metadata.SecurityDecisions.Encryption for the full rationale.
             - ServerSideEncryptionByDefault:
-                SSEAlgorithm: 'AES256'
+                SSEAlgorithm: 'aws:kms'
               BucketKeyEnabled: true
 
         PublicAccessBlockConfiguration:
@@ -449,6 +647,30 @@
           BlockPublicPolicy: true
           IgnorePublicAcls: true
           RestrictPublicBuckets: true
+
+        LifecycleConfiguration:
+          Rules:
+            # Rule 1: expire CodePipeline-managed artifacts after 90 days.
+            # Prefix intentionally targets the pipeline-name path only, so
+            # this rule never matches anything under state/.
+            - Id: ExpirePipelineArtifacts
+              Status: Enabled
+              Prefix: !Sub "${NamingConvention}-pipeline/"
+              ExpirationInDays: 90
+              NoncurrentVersionExpiration:
+                NoncurrentDays: 30
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 7
+            # Rule 2: keep state/ files. NO ExpirationInDays = current
+            # versions are preserved forever (drift detection depends on it).
+            # Old versions are pruned after 365 days for forensic history.
+            - Id: PreserveState
+              Status: Enabled
+              Prefix: state/
+              NoncurrentVersionExpiration:
+                NoncurrentDays: 365
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 7
 
   ## +-------------------------------+ ##
   ## | S3 Bucket Policy for Artifact | ##
@@ -473,6 +695,25 @@
               Condition:
                 Bool:
                   aws:SecureTransport: false
+            # Protect the state/ prefix against tampering. Only the deploy
+            # CodeBuild role legitimately writes/deletes state files; every
+            # other principal (including other roles in this account) is
+            # denied PutObject/DeleteObject on state/*. This makes the
+            # drift-detection state trustworthy without needing HMAC signing,
+            # because the set of writers is enforced by the bucket policy.
+            # Reads are NOT restricted here. Break-glass: an admin can edit
+            # this policy temporarily to recover a state file by hand.
+            - Sid: RestrictStateWritesToDeployRole
+              Effect: Deny
+              Principal:
+                AWS: "*"
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${CxMgrartifactsBucket}/state/*
+              Condition:
+                StringNotEquals:
+                  aws:PrincipalArn: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
 
   ## +-----------------------------------------------------------------------------------------------------------+ ##
   ## | Create a CodePipeline with stages: Source, Template Validation, Customer Managed Policies and Assignments | ##
@@ -481,7 +722,7 @@
     CodePipeline:
       Type: AWS::CodePipeline::Pipeline
       Properties:
-        Name: cx-mng-policies-pipeline
+        Name: !Sub "${NamingConvention}-pipeline"
         RoleArn: !GetAtt CodePipelineRole.Arn
         ArtifactStore:
           Type: S3
@@ -500,7 +741,7 @@
                 Configuration:
                   ConnectionArn: !If [ CreateCodeStarConnectionGitHub, !GetAtt CodeStarConnectionGitHub.ConnectionArn, !GetAtt CodeStarConnectionGitLab.ConnectionArn ]
                   FullRepositoryId: !Sub ${RepositoryOwner}/${RepositoryName}
-                  BranchName: "main"
+                  BranchName: !Ref BranchName
                 RunOrder: 1
                 OutputArtifacts:
                   - Name: SourceOutput
@@ -536,6 +777,36 @@
                   - Name: SourceOutput
                 OutputArtifacts:
                   - Name: RoleValidationOutput
+
+          - Name: DryRun
+            Actions:
+              - Name: DryRun
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref DryRunCodeBuildProject
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: SourceOutput
+                OutputArtifacts:
+                  - Name: DryRunOutput
+
+          - !If
+            - cManualApproval
+            - Name: Approval
+              Actions:
+                - Name: Approval
+                  ActionTypeId:
+                    Category: Approval
+                    Owner: AWS
+                    Version: '1'
+                    Provider: Manual
+                  Configuration:
+                    CustomData: "Review DryRun logs and approve before deploying customer managed policies."
+            - !Ref AWS::NoValue
 
           - Name: CustomerManagedPolicies
             Actions:
