@@ -1,0 +1,15 @@
+# Development / test dependencies. Not needed for the pipeline runtime.
+# Install with:  pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=8.0,<9.0
+moto[iam,s3,sts]>=5.0,<6.0
+
+# Parses CloudFormation YAML in tests/test_stackset_role_template.py
+PyYAML>=6.0,<7.0
+
+# Architecture diagram generator (scripts/generate_architecture_diagram.py).
+# Requires Graphviz installed system-wide (brew install graphviz / apt-get install graphviz).
+diagrams>=0.23,<1.0
+pillow>=10.0,<13.0
