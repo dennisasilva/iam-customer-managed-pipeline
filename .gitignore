@@ -40,6 +40,23 @@ dist/
 samconfig.toml
 cdk.out/
 
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+# Nunca versione tfvars reais: podem conter o external_id (segredo).
+# O arquivo terraform.tfvars.example (sem segredos) É versionado de propósito.
+*.tfvars
+*.auto.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
 # Generated step markers used by scripts/generate_architecture_diagram.py
 images/_step_markers/
 
