@@ -93,7 +93,7 @@ sequenceDiagram
     CMP->>S3: 17. grava state da conta no S3
     CMP-->>CP: concluído
 
-    Note over Dev,CW: ✅ Políticas sincronizadas nas contas-alvo; state versionado no S3
+    Note over Dev,CW: ✅ Políticas sincronizadas nas contas-alvo — state versionado no S3
 ```
 
 ## Pré-requisitos
