@@ -1,0 +1,13 @@
+# Copie para terraform.tfvars e ajuste os valores.
+# Gere o external_id com:  openssl rand -hex 32
+# Use o MESMO valor no módulo terraform/deploy-role (contas-alvo).
+
+region            = "us-east-1"
+repository_type   = "GitHub"
+repository_owner  = "dennisasilva"
+repository_name   = "iam-cx-mng-pipeline"
+branch_name       = "main"
+naming_convention = "cx-mng-pipeline"
+manual_approval   = true
+
+# external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"
