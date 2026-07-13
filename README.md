@@ -9,15 +9,25 @@ Pipeline CI/CD para gerenciamento automatizado de IAM Customer Managed Policies 
 > Fonte editável: [`images/architecture-diagram.drawio`](images/architecture-diagram.drawio).
 > A imagem PNG é regerada via [`scripts/generate_architecture_diagram.py`](scripts/generate_architecture_diagram.py) (requer `graphviz` no sistema e `diagrams` no Python).
 
-```
-GitHub → CodeStar Connection → Pipeline (6 stages) → Target AWS Accounts
-                                    │
-                                    ├── Source
-                                    ├── TemplateValidation
-                                    ├── RoleValidation
-                                    ├── DryRun
-                                    ├── Approval (manual, opcional)
-                                    └── CustomerManagedPolicies
+```mermaid
+flowchart LR
+    Dev([Desenvolvedor]) -->|"git push (main)"| Repo[(Repositório GitHub)]
+    Repo -->|CodeStar Connection| CP{{AWS CodePipeline V2}}
+
+    subgraph Pipeline["Conta de Pipeline"]
+      direction TB
+      S["Source"] --> TV["TemplateValidation"] --> RV["RoleValidation"] --> DR["DryRun"] --> AP["Approval<br/>(manual, opcional)"] --> CMP["CustomerManagedPolicies"]
+    end
+
+    CP --> S
+    RV -. "valida acesso à role" .-> Role
+    CMP -->|"sts:AssumeRole + ExternalId"| Role["deploy-customer-managed-policy<br/>(cada conta-alvo)"]
+    Role --> IAM[("IAM Customer Managed Policies<br/>tag cx-mng:true")]
+    CMP <-->|"state I/O"| S3[("Artifact Bucket + State<br/>SSE-KMS")]
+    SS["StackSet"] -. "cria a role nas contas da OU" .-> Role
+
+    classDef store fill:#f6f8fa,stroke:#8b949e,color:#24292f;
+    class Repo,IAM,S3 store;
 ```
 
 ## Pré-requisitos
