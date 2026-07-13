@@ -75,7 +75,7 @@ sequenceDiagram
 
     Note over DR,S3: Estágio DryRun
     CP->>DR: 10. inicia (--dry-run)
-    DR->>S3: 11. lê state/&lt;account&gt;.json
+    DR->>S3: 11. lê state da conta no S3
     DR->>DR: 12. calcula o diff (sem mutar nada)
     DR-->>CP: OK
 
@@ -90,7 +90,7 @@ sequenceDiagram
     STS-->>CMP: credenciais temporárias
     CMP->>IAM: 16. Create/Update/Delete policies (tag cx-mng:true)
     IAM-->>CMP: aplicado (cap de 5 versões gerido)
-    CMP->>S3: 17. grava state/&lt;account&gt;.json
+    CMP->>S3: 17. grava state da conta no S3
     CMP-->>CP: concluído
 
     Note over Dev,CW: ✅ Políticas sincronizadas nas contas-alvo; state versionado no S3
