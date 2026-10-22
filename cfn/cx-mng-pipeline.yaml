@@ -537,7 +537,11 @@
                     - codebuild:StartBuild
                     - codebuild:BatchGetBuilds
                     - codebuild:StopBuild
-                  Resource: "*"
+                  Resource:
+                    - !GetAtt TemplateValidationCodeBuildProject.Arn
+                    - !GetAtt RoleValidationCodeBuildProject.Arn
+                    - !GetAtt DryRunCodeBuildProject.Arn
+                    - !GetAtt CustomerManagedPoliciesCodeBuildProject.Arn
                 - Effect: Allow
                   Action:
                     - logs:CreateLogGroup
