@@ -143,9 +143,14 @@ resource "aws_iam_role_policy" "code_pipeline" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:StopBuild"]
-        Resource = "*"
+        Effect = "Allow"
+        Action = ["codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:StopBuild"]
+        Resource = [
+          aws_codebuild_project.template_validation.arn,
+          aws_codebuild_project.role_validation.arn,
+          aws_codebuild_project.dry_run.arn,
+          aws_codebuild_project.customer_managed_policies.arn,
+        ]
       },
       local.logs_statement,
       {
