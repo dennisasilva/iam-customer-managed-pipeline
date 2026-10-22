@@ -127,9 +127,40 @@ def policy_hash(document: dict) -> str:
     return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
 
+# Reserved tag key owned by the pipeline. Repo-supplied Tags that use this key
+# are stripped before any iam.tag_policy call, so a policy template cannot flip
+# or remove the ownership tag that gates the deploy role's
+# ``aws:ResourceTag/cx-mng=true`` condition.
+RESERVED_TAG_KEY = "cx-mng"
+RESERVED_TAG_VALUE = "true"
+
+
 def filter_tags(tags: list) -> list:
-    """Drop tag entries that are missing Key or Value."""
-    return [t for t in tags if t.get("Key") and t.get("Value")]
+    """Return repo-supplied tags with blank entries dropped and reserved keys stripped.
+
+    The pipeline owns the ``cx-mng`` tag key: it is applied by this script on
+    create and re-asserted on every update, and the deploy role's inline policy
+    gates every destructive IAM API on ``aws:ResourceTag/cx-mng=true``. If a
+    repository template were allowed to carry ``{"Key": "cx-mng", ...}`` the
+    subsequent ``iam.tag_policy`` call would overwrite the ownership tag and
+    permanently remove the policy from pipeline (and IAM) control. Strip it
+    here with a loud warning so operators notice the dropped entry.
+    """
+    cleaned: list = []
+    for tag in tags:
+        key = tag.get("Key")
+        value = tag.get("Value")
+        if not key or not value:
+            continue
+        if key == RESERVED_TAG_KEY:
+            LOG.warning(
+                "Ignoring repo-supplied reserved tag %r=%r: this key is "
+                "managed by the pipeline and cannot be set from a template.",
+                key, value,
+            )
+            continue
+        cleaned.append(tag)
+    return cleaned
 
 
 def _validate_account_id(account_id, context: str) -> None:
@@ -244,6 +275,34 @@ def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict)
             LOG.info("  Statement '%s' Resources added: %s", sid, res_added)
         if res_removed:
             LOG.info("  Statement '%s' Resources removed: %s", sid, res_removed)
+
+
+def diff_tags(
+    account_id: str,
+    policy_name: str,
+    old_tags: dict,
+    new_tags: dict,
+) -> None:
+    """Log tag additions/removals/value changes between two {Key: Value} maps.
+
+    Called from the update path so DryRun output surfaces tag changes a
+    reviewer must see before approval - previously only policy document
+    changes appeared in the diff, which hid attacks that targeted the
+    ``cx-mng`` ownership tag.
+    """
+    if old_tags == new_tags:
+        return
+    LOG.info("[%s] TAG DIFF '%s':", account_id, policy_name)
+    for key in sorted(set(old_tags) | set(new_tags)):
+        if key not in old_tags:
+            LOG.info("  + Tag %r added with value %r", key, new_tags[key])
+        elif key not in new_tags:
+            LOG.info("  - Tag %r removed (was %r)", key, old_tags[key])
+        elif old_tags[key] != new_tags[key]:
+            LOG.info(
+                "  ~ Tag %r changed: %r -> %r",
+                key, old_tags[key], new_tags[key],
+            )
 
 
 def get_current_policy_doc(iam_client, policy_arn: str):
@@ -368,7 +427,7 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                         existing_tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
 
                         # Safety check: only touch policies tagged as managed by this pipeline.
-                        if existing_tags.get("cx-mng") != "true":
+                        if existing_tags.get(RESERVED_TAG_KEY) != RESERVED_TAG_VALUE:
                             LOG.info(
                                 "%s[%s] '%s' has no cx-mng:true tag. Skipping.",
                                 log_prefix, account_id, policy_name,
@@ -378,6 +437,17 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                         current_doc = get_current_policy_doc(iam, policy_arn)
                         if current_doc:
                             diff_policy(account_id, policy_name, current_doc, policy_document)
+
+                        # Always re-assert the reserved cx-mng ownership tag on
+                        # every update: filter_tags has already stripped it from
+                        # repo-supplied tags, so prepending it here guarantees
+                        # the TagPolicy call cannot flip or drop the key.
+                        tags_to_apply = (
+                            [{"Key": RESERVED_TAG_KEY, "Value": RESERVED_TAG_VALUE}]
+                            + policy_tags
+                        )
+                        projected_tags = {t["Key"]: t["Value"] for t in tags_to_apply}
+                        diff_tags(account_id, policy_name, existing_tags, projected_tags)
 
                         LOG.info("%s[%s] UPDATE '%s'", log_prefix, account_id, policy_name)
                         if not args.dry_run:
@@ -395,8 +465,10 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                                 PolicyDocument=json.dumps(policy_document),
                                 SetAsDefault=True,
                             )
-                            if policy_tags:
-                                iam.tag_policy(PolicyArn=policy_arn, Tags=policy_tags)
+                            # Re-apply tags unconditionally so the ownership
+                            # tag is written back even when the template
+                            # declares no Tags of its own.
+                            iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
 
                             policies_state[policy_name] = {
                                 "arn": policy_arn,
@@ -417,7 +489,13 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                                 Description=description,
                             )
                             policy_arn = response["Policy"]["Arn"]
-                            tags_to_apply = [{"Key": "cx-mng", "Value": "true"}] + policy_tags
+                            # filter_tags has already stripped any repo-supplied
+                            # ``cx-mng`` entry, so prepending the reserved tag
+                            # here cannot collide with user tags.
+                            tags_to_apply = (
+                                [{"Key": RESERVED_TAG_KEY, "Value": RESERVED_TAG_VALUE}]
+                                + policy_tags
+                            )
                             iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
 
                             policies_state[policy_name] = {

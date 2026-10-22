@@ -468,7 +468,7 @@ Arquivo JSON em `templates/customer-managed-policies/` com a definição da poli
 **Convenções:**
 - `PolicyName` deve ser igual ao **nome do arquivo** sem `.json` (a stage TemplateValidation valida unicidade entre os PolicyNames).
 - `Path` deve começar e terminar com `/`. Padrão é `/`.
-- `Tags` declaradas aqui são aplicadas além da tag obrigatória `cx-mng:true` que a pipeline adiciona em toda policy criada.
+- `Tags` declaradas aqui são aplicadas além da tag obrigatória `cx-mng:true` que a pipeline adiciona em toda policy criada. A chave `cx-mng` é **reservada** pela pipeline: templates que declararem essa chave são rejeitados pela stage `TemplateValidation` e, por defesa em profundidade, são descartados pelo deploy script e pelas condições da role (`aws:RequestTag/cx-mng`/`aws:TagKeys`).
 
 ## Suite de testes
 
