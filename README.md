@@ -98,28 +98,71 @@ sequenceDiagram
 
 ## Pré-requisitos
 
-### 1. GitHub Fine-Grained Personal Access Token
+### 1. GitHub Fine-Grained Personal Access Token (bootstrap token)
 
-Crie um token no GitHub com as seguintes permissões:
+> ⚠️ **Escopo elevado = uso único.** O token descrito aqui é usado **apenas** pelo recurso `AWS::CodeStar::GitHubRepository` (ver `cfn/cx-mng-pipeline.yaml:148-160`) para **criar o repositório pela primeira vez**. Depois que o repositório existir, o token deve ser **revogado** (ou substituído por um token *downscoped* a `Contents: read` / `Metadata: read` somente neste repositório) e o secret do Secrets Manager atualizado — veja a seção [Pós-bootstrap: downscoping obrigatório do token](#pós-bootstrap-downscoping-obrigatório-do-token). A pipeline em estado estacionário autentica no GitHub via **CodeStar Connection** (`cfn/cx-mng-pipeline.yaml:741-742`), não por este PAT.
 
-- **Account permissions:** `Administration` → Read and write
-- **Repository permissions:**
-  - `Contents` → Read and write
-  - `Metadata` → Read-only
-  - `Issues` → Read and write
+**Preferencial — GitHub App installation token:** sempre que possível, use um **GitHub App** instalado apenas em `${RepositoryOwner}/${RepositoryName}` e gere um *installation token* (vida máxima de 1 hora) como `GITHUB_TOKEN` para o bootstrap. Isso dá expiração nativa, restrição ao repositório único e trilha de auditoria por `installation_id`, evitando um PAT de conta de longa duração.
+
+**Alternativa — Fine-Grained PAT (apenas se GitHub App não for viável):**
+
+- Marque **Expiration** com o menor prazo possível (sugerido: ≤ 7 dias, apenas durante o bootstrap).
+- **Resource owner:** `${RepositoryOwner}` (nunca a conta pessoal se o repo for de uma organização).
+- **Repository access:** `Only select repositories` → selecione **apenas** `${RepositoryOwner}/${RepositoryName}` (ou, se o repo ainda não existir, use `All repositories` do owner e revogue o token logo após a criação).
+- **Permissions estritamente limitadas ao que a API de criação exige:**
+  - **Account permissions:** `Administration` → Read and write — **requerido apenas** para o endpoint que o CloudFormation chama para criar o repositório privado (`POST /user/repos` / `POST /orgs/{org}/repos`). Nenhum passo da pipeline em runtime usa esta permissão.
+  - **Repository permissions:**
+    - `Contents` → Read and write (necessário para o seed inicial a partir do S3)
+    - `Metadata` → Read-only (obrigatório em todo fine-grained token)
+    - `Issues` → Read and write (combina com `EnableIssues: true`)
+
+**Não conceda** nenhuma outra permission (em particular: `Administration` em nível de *repositório* não é necessária e permitiria deletar o repo ou alterar branch protection / rulesets — mantê-la desmarcada é o que impede este token de desarmar os controles descritos em [Baseline de proteção da branch rastreada](#baseline-de-proteção-da-branch-rastreada)).
 
 Acesse: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token
 
 ### 2. AWS Secrets Manager
 
-Armazene o token do GitHub no Secrets Manager:
+Armazene o token do GitHub no Secrets Manager. Documente a data de expiração do token no `--description` para que a rotação não seja esquecida:
 
 ```bash
 aws secretsmanager create-secret \
   --name dev/cx-mgn-pipe/github \
   --secret-string "<GITHUB_TOKEN>" \
+  --description "Bootstrap token para AWS::CodeStar::GitHubRepository. Downscope/revogue após o primeiro deploy — ver README 'Pós-bootstrap'. Expira: <YYYY-MM-DD>" \
   --region us-east-1
 ```
+
+Após o bootstrap, atualize este secret com o token *downscoped* (ou um placeholder revogado) usando `aws secretsmanager put-secret-value --secret-id dev/cx-mgn-pipe/github --secret-string "<NEW_SCOPED_TOKEN>"`. O recurso `CxMngGitHubRepository` resolve o valor pelo nome do secret via `{{resolve:secretsmanager:${SecretId}::::}}`, então a atualização propaga em qualquer `cloudformation update-stack` subsequente sem alterar o template.
+
+#### Baseline de proteção da branch rastreada
+
+Assim que o repositório existir, configure os seguintes controles no GitHub para que o token não seja o controle que os desabilita:
+
+- **Branch protection / ruleset** em `${BranchName}` (default `main`):
+  - `Require a pull request before merging` com `Require approvals ≥ 1` e `Dismiss stale approvals on new commits`.
+  - `Require review from Code Owners`.
+  - `Require status checks to pass before merging` (quando houver CI de pré-merge).
+  - `Require signed commits` (recomendado).
+  - `Restrict who can push to matching branches` — remover `Allow force pushes` e `Allow deletions`.
+- **`CODEOWNERS`** na raiz do repositório cobrindo `cfn/`, `source/`, `templates/` com revisores humanos distintos do operador do pipeline.
+- Documentar que **a conta/App que detém o token do bootstrap NÃO deve estar nos bypass actors** do ruleset.
+
+Esse baseline é parte do modelo de confiança do pipeline (`Source action` em `cfn/cx-mng-pipeline.yaml:732-747` confia no que estiver na branch rastreada) e deve ser auditado periodicamente.
+
+#### Pós-bootstrap: downscoping obrigatório do token
+
+Depois que `CxMngGitHubRepository` tiver criado o repositório com sucesso (passo 6 da [Ordem de Deploy](#ordem-de-deploy)), execute **imediatamente** um dos caminhos abaixo:
+
+1. **Revogar o token de bootstrap** (preferido quando `CxMngGitHubRepository` for removido do template no próximo update — veja a nota de desacoplamento abaixo).
+2. **Substituir por token *downscoped*** (quando o recurso ainda é mantido no stack para gerenciamento declarativo): gere um novo fine-grained PAT (ou installation token do GitHub App) com **apenas**:
+   - **Repository access:** `Only select repositories` → `${RepositoryOwner}/${RepositoryName}`.
+   - **Repository permissions:** `Contents` → Read-only, `Metadata` → Read-only. **Nada** em `Account permissions`.
+   - Atualize o secret: `aws secretsmanager put-secret-value --secret-id dev/cx-mgn-pipe/github --secret-string "<DOWNSCOPED_TOKEN>"`.
+   - Revogue o token original no GitHub.
+
+**Rotação recorrente:** rotacione o secret conforme a política da conta (sugerido: ≤ 90 dias para PAT, ≤ 1 hora via GitHub App). Em cada rotação, atualize `dev/cx-mgn-pipe/github` com `put-secret-value` **antes** de revogar o token antigo, para evitar janela em que um `cloudformation update-stack` resolva um secret inválido.
+
+**Desacoplamento recomendado (opcional, uma vez por ambiente):** após o repositório estar criado e com branch protection configurada, remova o recurso `CxMngGitHubRepository` do template e aplique um `cloudformation update-stack` com `UsePreviousValue=true` nos demais parâmetros. Isso elimina a dependência do stack em `RepositoryAccessToken` / `SecretId` por completo e permite revogar o PAT sem precisar manter um token válido no secret. O repositório continua rastreado pelo pipeline via CodeStar Connection, que não usa este token.
 
 ### 3. S3 Bucket com código inicial
 
@@ -229,6 +272,7 @@ Todos os parâmetros têm validação de input (`AllowedPattern`, `MinLength`, `
 | `ExternalId` | Shared secret usado em todo `sts:AssumeRole` cross-account. Mesmo valor passado nos 2 stacks (pipeline + StackSet). | _(sem default — obrigatório)_ | 16-64 chars `[A-Za-z0-9_-]`, `NoEcho: true` |
 | `NamingConvention` | Prefixo para nomes dos recursos | `cx-mng-pipeline` | lowercase, max 30 chars (limita IAM RoleName a 64 chars) |
 | `ManualApproval` | Habilitar stage de aprovação manual | `true` | `AllowedValues: ['true', 'false']` |
+| `OrgId` | AWS Organizations ID (p.ex. `o-xxxxxxxxxx`) que detém as contas-alvo. Usado em `Condition: aws:ResourceOrgID` nos `sts:AssumeRole` cross-account para que uma conta fora da organização não possa ser assumida mesmo que apareça em `assignments.json`. | _(sem default — obrigatório)_ | `^o-[a-z0-9]{10,32}$` |
 
 ### Comando de deploy
 
@@ -248,6 +292,7 @@ aws cloudformation deploy \
     ExternalId=<EXTERNAL_ID_VALUE> \
     NamingConvention=cx-mng-pipeline \
     ManualApproval=true \
+    OrgId=<AWS_ORGANIZATIONS_ID> \
   --region us-east-1
 ```
 
@@ -468,7 +513,7 @@ Arquivo JSON em `templates/customer-managed-policies/` com a definição da poli
 **Convenções:**
 - `PolicyName` deve ser igual ao **nome do arquivo** sem `.json` (a stage TemplateValidation valida unicidade entre os PolicyNames).
 - `Path` deve começar e terminar com `/`. Padrão é `/`.
-- `Tags` declaradas aqui são aplicadas além da tag obrigatória `cx-mng:true` que a pipeline adiciona em toda policy criada.
+- `Tags` declaradas aqui são aplicadas além da tag obrigatória `cx-mng:true` que a pipeline adiciona em toda policy criada. A chave `cx-mng` é **reservada** pela pipeline: templates que declararem essa chave são rejeitados pela stage `TemplateValidation` e, por defesa em profundidade, são descartados pelo deploy script e pelas condições da role (`aws:RequestTag/cx-mng`/`aws:TagKeys`).
 
 ## Suite de testes
 
@@ -720,13 +765,16 @@ aws cloudformation deploy ... && \
 
 ## Ordem de Deploy
 
-1. Criar secret no Secrets Manager com o token GitHub
+1. Criar secret no Secrets Manager com o token GitHub de **bootstrap** (escopo mínimo descrito na seção 1 de Pré-requisitos; expiração curta — preferir GitHub App installation token)
 2. Criar bucket S3 e fazer upload do `.zip` com código inicial
 3. Deploy do StackSet `cx-mng-stackset-deploy-role.yaml` na OU raiz
 4. Deploy do stack `cx-mng-pipeline.yaml` na conta da pipeline
 5. **Rodar `scripts/post_deploy_smoke_test.py`** para confirmar que o stack está saudável
 6. Completar a conexão CodeStar no console AWS
 7. Renomear branch `master` para `main` no repositório GitHub (se necessário)
+8. **Configurar branch protection / ruleset e `CODEOWNERS`** em `${BranchName}` conforme [Baseline de proteção da branch rastreada](#baseline-de-proteção-da-branch-rastreada) — a pipeline confia no conteúdo da branch, então este é o controle que o token de bootstrap NÃO pode poder desabilitar
+9. **Downscoping/revogação do token de bootstrap**: substituir o valor em `dev/cx-mgn-pipe/github` por um token com apenas `Contents: read` / `Metadata: read` (ou, se `CxMngGitHubRepository` for removido do template, revogar o PAT por completo). Ver [Pós-bootstrap: downscoping obrigatório do token](#pós-bootstrap-downscoping-obrigatório-do-token)
+10. Agendar rotação periódica do secret (`dev/cx-mgn-pipe/github`) conforme a política da conta — atualizar o secret **antes** de revogar o token antigo
 
 ## Decisões de Segurança
 

@@ -64,6 +64,16 @@ variable "manual_approval" {
   default     = true
 }
 
+variable "org_id" {
+  description = "AWS Organizations ID (e.g. o-xxxxxxxxxx) that owns every target account. Used to restrict sts:AssumeRole on the cross-account deploy role to roles that belong to this organization, so a repository-supplied target account ID outside the organization cannot be assumed."
+  type        = string
+
+  validation {
+    condition     = can(regex("^o-[a-z0-9]{10,32}$", var.org_id))
+    error_message = "org_id deve ser um AWS Organizations ID válido (ex.: o-abcd1234ef)."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Observação de escopo (paridade com o CloudFormation):
 #

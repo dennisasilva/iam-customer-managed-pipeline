@@ -112,6 +112,12 @@
         - 'false'
       Default: 'true'
 
+    OrgId:
+      Description: 'AWS Organizations ID (e.g. o-xxxxxxxxxx) that owns every target account. Used to restrict sts:AssumeRole on the cross-account deploy role to roles that belong to this organization, so a repository-supplied target account ID outside the organization cannot be assumed.'
+      Type: String
+      AllowedPattern: '^o-[a-z0-9]{10,32}$'
+      ConstraintDescription: 'OrgId must be a valid AWS Organizations ID (e.g. o-abcd1234ef).'
+
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
   ## +------------------------------------------------------+ ##
@@ -384,6 +390,9 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  Condition:
+                    StringEquals:
+                      'aws:ResourceOrgID': !Ref OrgId
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +511,9 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  Condition:
+                    StringEquals:
+                      'aws:ResourceOrgID': !Ref OrgId
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##
@@ -537,7 +549,11 @@
                     - codebuild:StartBuild
                     - codebuild:BatchGetBuilds
                     - codebuild:StopBuild
-                  Resource: "*"
+                  Resource:
+                    - !GetAtt TemplateValidationCodeBuildProject.Arn
+                    - !GetAtt RoleValidationCodeBuildProject.Arn
+                    - !GetAtt DryRunCodeBuildProject.Arn
+                    - !GetAtt CustomerManagedPoliciesCodeBuildProject.Arn
                 - Effect: Allow
                   Action:
                     - logs:CreateLogGroup
