@@ -43,6 +43,7 @@ import sys
 from datetime import datetime, timezone
 
 import boto3
+import botocore
 from botocore.config import Config
 
 
@@ -410,15 +411,20 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                         # Policy does not exist yet → create it.
                         LOG.info("%s[%s] CREATE '%s'", log_prefix, account_id, policy_name)
                         if not args.dry_run:
+                            # Tag atomically with create: this is the only way the
+                            # deploy role's iam:CreatePolicy grant (conditioned on
+                            # aws:RequestTag/cx-mng=true) authorizes the call, and
+                            # it guarantees we never leave an untagged, unmanaged
+                            # policy behind if a follow-up tag call fails.
+                            tags_to_apply = [{"Key": "cx-mng", "Value": "true"}] + policy_tags
                             response = iam.create_policy(
                                 PolicyName=policy_name,
                                 Path=path,
                                 PolicyDocument=json.dumps(policy_document),
                                 Description=description,
+                                Tags=tags_to_apply,
                             )
                             policy_arn = response["Policy"]["Arn"]
-                            tags_to_apply = [{"Key": "cx-mng", "Value": "true"}] + policy_tags
-                            iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
 
                             policies_state[policy_name] = {
                                 "arn": policy_arn,
@@ -428,6 +434,19 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                             }
                             LOG.info("[%s] '%s' created.", account_id, policy_name)
 
+                    except botocore.exceptions.ClientError as exc:
+                        # AccessDenied on create/tag means the IAM role is misconfigured
+                        # (or the policy name collides with an un-owned resource). Do NOT
+                        # swallow it: an un-tagged, un-managed policy would be invisible
+                        # to every later update/cleanup pass. Fail the build loudly.
+                        error_code = exc.response.get("Error", {}).get("Code", "")
+                        if error_code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+                            LOG.error(
+                                "[%s] Authorization failure on '%s': %s",
+                                account_id, policy_name, exc,
+                            )
+                            raise
+                        LOG.error("[%s] Error on '%s': %s", account_id, policy_name, exc)
                     except Exception as exc:  # noqa: BLE001 - per-policy failures must not stop the run
                         LOG.error("[%s] Error on '%s': %s", account_id, policy_name, exc)
 

@@ -90,14 +90,28 @@ resource "aws_iam_role_policy" "deploy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # Leitura + criação. CreatePolicy não pode ser restrito por tag porque
-      # a policy (e a tag) ainda não existem no momento da criação; o script
-      # aplica cx-mng:true logo em seguida via TagPolicy.
+      # Leitura + criação. CreatePolicy não aceita condição por
+      # aws:ResourceTag (a policy e sua tag ainda não existem no
+      # momento da autorização), então restringimos por
+      # aws:RequestTag/cx-mng = true e exigimos que o script passe
+      # Tags=... atomicamente em create_policy. Mesmo tratamento vale
+      # para TagPolicy quando aplicada à criação.
       {
         Sid    = "IAMPolicyReadAndCreate"
         Effect = "Allow"
         Action = [
           "iam:CreatePolicy",
+          "iam:TagPolicy",
+        ]
+        Resource = [
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*",
+        ]
+        Condition = { StringEquals = { "aws:RequestTag/cx-mng" = "true" } }
+      },
+      {
+        Sid    = "IAMPolicyRead"
+        Effect = "Allow"
+        Action = [
           "iam:GetPolicy",
           "iam:GetPolicyVersion",
           "iam:GetRole",
