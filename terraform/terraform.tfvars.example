@@ -10,4 +10,9 @@ branch_name       = "main"
 naming_convention = "cx-mng-pipeline"
 manual_approval   = true
 
+# AWS Organizations ID that owns every target account (restricts
+# sts:AssumeRole on the cross-account deploy role to roles inside this org).
+# Find it with: aws organizations describe-organization --query 'Organization.Id'
+# org_id = "o-xxxxxxxxxx"
+
 # external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"

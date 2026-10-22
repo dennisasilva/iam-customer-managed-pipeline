@@ -229,6 +229,7 @@ Todos os parâmetros têm validação de input (`AllowedPattern`, `MinLength`, `
 | `ExternalId` | Shared secret usado em todo `sts:AssumeRole` cross-account. Mesmo valor passado nos 2 stacks (pipeline + StackSet). | _(sem default — obrigatório)_ | 16-64 chars `[A-Za-z0-9_-]`, `NoEcho: true` |
 | `NamingConvention` | Prefixo para nomes dos recursos | `cx-mng-pipeline` | lowercase, max 30 chars (limita IAM RoleName a 64 chars) |
 | `ManualApproval` | Habilitar stage de aprovação manual | `true` | `AllowedValues: ['true', 'false']` |
+| `OrgId` | AWS Organizations ID (p.ex. `o-xxxxxxxxxx`) que detém as contas-alvo. Usado em `Condition: aws:ResourceOrgID` nos `sts:AssumeRole` cross-account para que uma conta fora da organização não possa ser assumida mesmo que apareça em `assignments.json`. | _(sem default — obrigatório)_ | `^o-[a-z0-9]{10,32}$` |
 
 ### Comando de deploy
 
@@ -248,6 +249,7 @@ aws cloudformation deploy \
     ExternalId=<EXTERNAL_ID_VALUE> \
     NamingConvention=cx-mng-pipeline \
     ManualApproval=true \
+    OrgId=<AWS_ORGANIZATIONS_ID> \
   --region us-east-1
 ```
 

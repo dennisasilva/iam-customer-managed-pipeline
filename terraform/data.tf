@@ -12,6 +12,12 @@ locals {
   artifact_bucket_name = "${local.account_id}-${local.region}-cx-mng-artfcs"
 
   # ARN da role cross-account de deploy (criada nas contas-alvo).
+  # O account field é um wildcard porque a role existe em cada conta gerenciada
+  # (criada pelo StackSet). O acesso é restringido pela condition
+  # aws:ResourceOrgID = var.org_id aplicada em todo sts:AssumeRole (veja
+  # local.assume_deploy_role_statement em iam.tf), para que uma conta fora da
+  # Organization não possa ser assumida mesmo que um Target de 12 dígitos
+  # qualquer apareça em templates/assignments/*.json.
   deploy_role_arn = "arn:aws:iam::*:role/deploy-customer-managed-policy"
 
   # Seleciona a conexão CodeStar de acordo com o tipo de repositório.

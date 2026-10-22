@@ -29,6 +29,20 @@ locals {
       StringEquals = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
     }
   }
+
+  # Restrict sts:AssumeRole on the cross-account deploy role to roles that
+  # belong to the configured AWS Organization. The resource ARN still uses an
+  # account wildcard (one deploy role is created per managed account via the
+  # StackSet), but aws:ResourceOrgID ensures a repository-supplied target
+  # account ID outside the organization cannot be assumed.
+  assume_deploy_role_statement = {
+    Effect   = "Allow"
+    Action   = "sts:AssumeRole"
+    Resource = local.deploy_role_arn
+    Condition = {
+      StringEquals = { "aws:ResourceOrgID" = var.org_id }
+    }
+  }
 }
 
 # ---------- Template Validation ----------
@@ -77,11 +91,7 @@ resource "aws_iam_role_policy" "role_validation" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
-      {
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
-      },
+      local.assume_deploy_role_statement,
     ]
   })
 }
@@ -107,11 +117,7 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
-      {
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
-      },
+      local.assume_deploy_role_statement,
     ]
   })
 }
