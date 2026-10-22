@@ -110,8 +110,9 @@ resource "aws_iam_role_policy" "deploy" {
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/deploy-customer-managed-policy",
         ]
       },
-      # Ações destrutivas/mutantes só em policies que já têm cx-mng:true.
-      # Faz do IAM (não só do script) o ponto de enforcement.
+      # Ações destrutivas sobre o documento da policy. Só em policies
+      # que já têm cx-mng:true. Faz do IAM (não só do script) o ponto
+      # de enforcement.
       {
         Sid    = "IAMPolicyModifyOnlyTagged"
         Effect = "Allow"
@@ -119,11 +120,36 @@ resource "aws_iam_role_policy" "deploy" {
           "iam:CreatePolicyVersion",
           "iam:DeletePolicy",
           "iam:DeletePolicyVersion",
-          "iam:TagPolicy",
-          "iam:UntagPolicy",
         ]
         Resource  = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
         Condition = { StringEquals = { "aws:ResourceTag/cx-mng" = "true" } }
+      },
+      # TagPolicy: só em policies cx-mng:true e sem permitir que a
+      # própria chamada mude a tag de propriedade. Se a request
+      # trouxer o key `cx-mng`, o valor TEM que ser "true"; se
+      # omitir o key, a tag existente é preservada pelas semânticas
+      # de merge do TagPolicy.
+      {
+        Sid    = "IAMTagPolicyOnlyPreservingOwnership"
+        Effect = "Allow"
+        Action = "iam:TagPolicy"
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/cx-mng" = "true" }
+          StringEqualsIfExists = { "aws:RequestTag/cx-mng" = "true" }
+        }
+      },
+      # UntagPolicy: só em policies cx-mng:true e nunca podendo
+      # remover a própria tag `cx-mng` (via aws:TagKeys).
+      {
+        Sid    = "IAMUntagPolicyExceptOwnership"
+        Effect = "Allow"
+        Action = "iam:UntagPolicy"
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/cx-mng" = "true" }
+          "ForAllValues:StringNotEquals" = { "aws:TagKeys" = ["cx-mng"] }
+        }
       },
     ]
   })
