@@ -1,5 +1,19 @@
 # Development / test dependencies. Not needed for the pipeline runtime.
-# Install with:  pip install -r requirements-dev.txt
+#
+# This file is the ABSTRACT input only (version ranges). Do NOT install it
+# directly on a host that holds deploy credentials. For reproducible,
+# hash-verified installs regenerate requirements-dev.lock with:
+#
+#   pip install --require-hashes pip-tools==<pinned>
+#   pip-compile --generate-hashes \
+#       --output-file=requirements-dev.lock requirements-dev.txt
+#
+# and install with:
+#
+#   pip install --require-hashes -r requirements-dev.lock
+#
+# See README.md (section "Reproducible / hash-pinned installs") and
+# tests/README.md for the full workflow.
 
 -r requirements.txt
 
