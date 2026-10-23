@@ -59,7 +59,7 @@ variable "naming_convention" {
 }
 
 variable "manual_approval" {
-  description = "Habilita o estágio de aprovação manual antes do deploy das policies."
+  description = "DEPRECATED. Manual approval is now mandatory; this variable is ignored and the Approval stage is always included."
   type        = bool
   default     = true
 }

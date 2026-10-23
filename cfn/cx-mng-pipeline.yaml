@@ -105,7 +105,7 @@
       ConstraintDescription: 'Must be lowercase, start with a letter, end with a letter or number, contain only letters/numbers/hyphens (2-30 chars).'
 
     ManualApproval:
-      Description: 'Enable manual approval stage before deploying customer managed policies'
+      Description: 'DEPRECATED. Manual approval is now mandatory and this parameter is ignored.'
       Type: String
       AllowedValues:
         - 'true'
@@ -119,7 +119,10 @@
   Conditions:
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
-    cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
+    # Manual approval is mandatory: the condition is retained to minimise
+    # template diff but is always true regardless of the ManualApproval
+    # parameter so the Approval stage is never skipped.
+    cManualApproval: !Equals [ 'true', 'true' ]
 
   Resources:
 
@@ -441,6 +444,13 @@
                   Condition:
                     StringEquals:
                       'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                - Effect: Allow
+                  # TemplateValidation calls accessanalyzer:ValidatePolicy on
+                  # every PolicyDocument to fail the build on ERROR /
+                  # SECURITY_WARNING findings before any cross-account deploy.
+                  Action:
+                    - access-analyzer:ValidatePolicy
+                  Resource: '*'
 
   ## +-------------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for CustomerManagedPoliciesCodeBuildProject project | ##

@@ -79,9 +79,9 @@ resource "aws_codepipeline" "pipeline" {
     }
   }
 
-  # Estágio de aprovação manual — incluído apenas quando manual_approval = true.
+  # Estágio de aprovação manual — agora obrigatório (var.manual_approval ignorada).
   dynamic "stage" {
-    for_each = var.manual_approval ? [1] : []
+    for_each = [1]
     content {
       name = "Approval"
       action {

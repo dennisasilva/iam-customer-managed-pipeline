@@ -16,7 +16,7 @@ flowchart LR
 
     subgraph Pipeline["Conta de Pipeline"]
       direction TB
-      S["Source"] --> TV["TemplateValidation"] --> RV["RoleValidation"] --> DR["DryRun"] --> AP["Approval<br/>(manual, opcional)"] --> CMP["CustomerManagedPolicies"]
+      S["Source"] --> TV["TemplateValidation"] --> RV["RoleValidation"] --> DR["DryRun"] --> AP["Approval<br/>(manual, obrigatório)"] --> CMP["CustomerManagedPolicies"]
     end
 
     CP --> S
@@ -59,9 +59,9 @@ sequenceDiagram
 
     Note over TV,AA: Estágio TemplateValidation
     CP->>TV: 4. inicia
-    TV->>TV: 5. valida JSON, PolicyName único, Path, Account IDs
-    TV->>AA: 6. validate_policy (boas práticas)
-    AA-->>TV: findings (ERROR falha o build)
+    TV->>TV: 5. valida JSON, PolicyName único, Path, Account IDs e estrutura de PolicyDocument (bloqueia Action:*, iam:*, NotAction, Resource:* em serviços sensíveis)
+    TV->>AA: 6. accessanalyzer:ValidatePolicy (IDENTITY_POLICY)
+    AA-->>TV: findings (ERROR/SECURITY_WARNING falha o build)
     TV->>CW: logs
     TV-->>CP: OK
 
@@ -79,7 +79,7 @@ sequenceDiagram
     DR->>DR: 12. calcula o diff (sem mutar nada)
     DR-->>CP: OK
 
-    opt ManualApproval = true
+    opt ManualApproval (obrigatório)
         CP->>OP: 13. aprovação manual
         OP-->>CP: aprova (após revisar os logs do DryRun)
     end
@@ -370,8 +370,18 @@ Roda `customer-managed-validation.py`. Valida:
 - **Unicidade do `PolicyName`** entre policies (sem duplicatas)
 - **Formato do `Path`** de cada policy (regex `^/(?:[A-Za-z0-9._=+-]+/)*$`, max 512 chars) — pega `//`, paths sem `/` no início/fim, chars proibidos
 - **Formato dos Account IDs** em `Target` (regex `^\d{12}$`) — pega typos do tipo trailing whitespace, formatação de planilha (vírgulas, traços), tipo errado (int em vez de string)
+- **Estrutura do `PolicyDocument`** — rejeita:
+  - `Version` diferente de `"2012-10-17"`;
+  - documento ausente, vazio, ou `Statement` não lista/objeto;
+  - `Effect` fora de `Allow`/`Deny`;
+  - `NotAction` e `NotResource` (invertem o guardrail);
+  - `Action: "*"` e service-wide wildcards (`iam:*`, `sts:*`, `organizations:*`, etc.);
+  - ações de privilege-escalation diretas (`iam:PassRole`, `iam:AttachRolePolicy`, `iam:CreateAccessKey`, `iam:CreateLoginProfile`, `iam:UpdateAssumeRolePolicy`, `iam:CreatePolicyVersion`, `iam:SetDefaultPolicyVersion`, etc.);
+  - `Effect: Allow` com `Resource: "*"` em serviços sensíveis (`iam`, `sts`, `kms`, `organizations`, `cloudtrail`, `config`, `access-analyzer`, `secretsmanager`, `sso`, `identitystore`, `ssm`);
+  - documento com mais de 6144 chars após minificação (limite IAM).
+- **IAM Access Analyzer `ValidatePolicy`** (PolicyType=IDENTITY_POLICY) em cada `PolicyDocument` — falha o build quando qualquer finding é `ERROR` ou `SECURITY_WARNING`. `SUGGESTION`/`WARNING` são logados mas não bloqueiam. A chamada é obrigatória: se `boto3`/`accessanalyzer` não estiverem disponíveis a stage falha (bypass via `--skip-access-analyzer` existe apenas para desenvolvimento local).
 
-Falha cedo, antes de qualquer call AWS, com mensagem indicando arquivo + SID + valor problemático.
+Falha cedo, antes de qualquer call AWS mutativa, com mensagem indicando arquivo + SID + valor problemático.
 
 ### 3. RoleValidation
 Roda `role-validation.py`. Para cada conta listada em qualquer `Target` dos assignments, faz `sts:AssumeRole` na role `deploy-customer-managed-policy` e chama `iam:GetRole` para confirmar que ela existe e está acessível. Falha **antes** de qualquer mudança se alguma conta não tiver a role configurada (StackSet ausente, role removida, etc.).
@@ -383,8 +393,8 @@ Roda `customer-managed-deploy.py --dry-run`:
 - Detecta drift (alterações manuais em policies gerenciadas pela pipeline)
 - **Não faz nenhuma mutação** — apenas reporta o que faria
 
-### 5. Approval (opcional)
-Stage de aprovação manual. O operador revisa os logs do DryRun no CodeBuild e aprova ou rejeita. Controlado pelo parâmetro `ManualApproval`.
+### 5. Approval (obrigatório)
+Stage de aprovação manual. O operador revisa os logs do DryRun no CodeBuild e aprova ou rejeita. A stage é sempre incluída; o parâmetro `ManualApproval` / variável `manual_approval` está depreciado e é ignorado.
 
 ### 6. CustomerManagedPolicies
 Roda `customer-managed-deploy.py` (sem `--dry-run`):

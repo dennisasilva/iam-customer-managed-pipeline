@@ -331,3 +331,261 @@ def test_real_templates_have_unique_policy_names(validation_module, project_root
 
     assert policies, "No policy templates were found in templates/customer-managed-policies/"
     validation_module.validate_unique_policy_name(policies)
+
+
+# --------------------------------------------------------------------------- #
+# validate_policy_documents
+# --------------------------------------------------------------------------- #
+
+
+def _mk(policy_document, name="P"):
+    return {"p.json": {"PolicyName": name, "Path": "/", "PolicyDocument": policy_document}}
+
+
+def test_validate_policy_documents_accepts_narrow_policy(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["ec2:DescribeInstances", "s3:GetObject"],
+                "Resource": "*",
+            }
+        ],
+    }
+    validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_action_star(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_iam_wildcard(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": ["iam:*"], "Resource": "*"}],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_iam_passrole(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_sts_wildcard(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "sts:*", "Resource": "*"}],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_not_action(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_not_resource(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "NotResource": "arn:aws:s3:::foo/*",
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_resource_star_sensitive(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"}
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_requires_policy_document(validation_module):
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents({"p.json": {"PolicyName": "P"}})
+
+
+def test_validate_policy_documents_requires_version(validation_module):
+    doc = {
+        "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_rejects_malformed_action(validation_module):
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "not a valid action", "Resource": "*"}
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_enforces_size_limit(validation_module):
+    # Build a huge valid-ish document that exceeds 6144 chars.
+    long_actions = [f"s3:Action{i:04d}" for i in range(1000)]
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": long_actions, "Resource": "*"}
+        ],
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_accepts_deny_wildcard(validation_module):
+    # Deny with service wildcards is useful (defensive) and not forbidden.
+    doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Deny",
+                "Action": ["ec2:TerminateInstances"],
+                "Resource": "*",
+            }
+        ],
+    }
+    validation_module.validate_policy_documents(_mk(doc))
+
+
+def test_validate_policy_documents_aggregates_errors(validation_module, caplog):
+    import logging
+    caplog.set_level(logging.ERROR)
+    policies = {
+        "ok.json": {
+            "PolicyName": "Ok",
+            "Path": "/",
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"}
+                ],
+            },
+        },
+        "bad.json": {
+            "PolicyName": "Bad",
+            "Path": "/",
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"}
+                ],
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="PolicyDocument validation failed"):
+        validation_module.validate_policy_documents(policies)
+    assert "bad.json" in caplog.text
+    assert "ok.json" not in caplog.text
+
+
+def test_real_templates_pass_policy_document_validation(validation_module, project_root):
+    """Smoke test: shipped sample policies pass structural validation."""
+    folder = project_root / "templates" / "customer-managed-policies"
+    policies = validation_module.load_policy_files(str(folder))
+    validation_module.validate_policy_documents(policies)
+
+
+# --------------------------------------------------------------------------- #
+# validate_policies_with_access_analyzer
+# --------------------------------------------------------------------------- #
+
+
+def test_access_analyzer_skip_flag_bypasses_call(validation_module):
+    """When skip=True the function must not try to import boto3 or make calls."""
+    # No ImportError should surface even if boto3 is unavailable; no exception.
+    validation_module.validate_policies_with_access_analyzer(
+        {"p.json": {"PolicyDocument": {"Version": "2012-10-17", "Statement": []}}},
+        region="us-east-1",
+        skip=True,
+    )
+
+
+def test_access_analyzer_fails_build_on_blocking_findings(validation_module, monkeypatch):
+    """ERROR / SECURITY_WARNING findings raise ValueError and fail the build."""
+    class _FakePaginator:
+        def paginate(self, **_kw):
+            return iter([{
+                "findings": [
+                    {"findingType": "SECURITY_WARNING", "issueCode": "PASS_ROLE_WITH_STAR_IN_RESOURCE", "findingDetails": "Allow PassRole with Resource *"},
+                    {"findingType": "SUGGESTION", "issueCode": "REDUNDANT", "findingDetails": "minor"},
+                ]
+            }])
+
+    class _FakeClient:
+        def get_paginator(self, _name):
+            return _FakePaginator()
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(_name, region_name=None):
+            return _FakeClient()
+
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "boto3", _FakeBoto3)
+
+    # Provide a stub botocore.exceptions module so the import inside the
+    # function finds BotoCoreError / ClientError without needing botocore.
+    import types
+    fake_botocore = types.ModuleType("botocore")
+    fake_botocore_exc = types.ModuleType("botocore.exceptions")
+    class _BotoCoreError(Exception):
+        pass
+    class _ClientError(Exception):
+        pass
+    fake_botocore_exc.BotoCoreError = _BotoCoreError
+    fake_botocore_exc.ClientError = _ClientError
+    monkeypatch.setitem(_sys.modules, "botocore", fake_botocore)
+    monkeypatch.setitem(_sys.modules, "botocore.exceptions", fake_botocore_exc)
+
+    policies = {
+        "p.json": {
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+                ],
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="Access Analyzer"):
+        validation_module.validate_policies_with_access_analyzer(
+            policies, region="us-east-1", skip=False,
+        )

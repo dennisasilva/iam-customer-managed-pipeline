@@ -52,6 +52,14 @@ resource "aws_iam_role_policy" "template_validation" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
+      {
+        # TemplateValidation calls accessanalyzer:ValidatePolicy on every
+        # PolicyDocument to fail the build on ERROR / SECURITY_WARNING
+        # findings before any cross-account deploy.
+        Effect   = "Allow"
+        Action   = ["access-analyzer:ValidatePolicy"]
+        Resource = "*"
+      },
     ]
   })
 }
