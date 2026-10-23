@@ -588,6 +588,150 @@ def test_create_update_skips_when_hash_in_state_matches_repo(
 
 
 @mock_aws
+def test_create_update_reconciles_live_drift_even_when_state_hash_matches(
+    deploy_module, aws_credentials, tmp_path
+):
+    """If the live policy was tampered with but the S3 state hash still matches
+    the repo hash, the engine must reconcile by creating a new policy version
+    that restores the approved document, and must signal drift (non-zero return).
+    This is the fix for the fast-path-skips-drift finding.
+    """
+    _create_deploy_role()
+    iam = boto3.client("iam", region_name="us-east-1")
+
+    # Create the policy with the APPROVED repo document and the cx-mng tag.
+    response = iam.create_policy(PolicyName="DriftMe", PolicyDocument=json.dumps(DEFAULT_POLICY_DOC))
+    policy_arn = response["Policy"]["Arn"]
+    iam.tag_policy(PolicyArn=policy_arn, Tags=[{"Key": "cx-mng", "Value": "true"}])
+
+    # Attacker tampers with the live default version (widens to iam:*).
+    tampered_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "iam:*", "Resource": "*"}],
+    }
+    iam.create_policy_version(
+        PolicyArn=policy_arn,
+        PolicyDocument=json.dumps(tampered_doc),
+        SetAsDefault=True,
+    )
+
+    # S3 state still remembers the APPROVED document's hash (fast-path precondition).
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="state-bucket")
+    state = {
+        "account_id": DEFAULT_ACCOUNT,
+        "policies": {
+            "DriftMe": {
+                "policy_hash": deploy_module.policy_hash(DEFAULT_POLICY_DOC),
+                "version_id": "v1",
+                "arn": policy_arn,
+            }
+        },
+    }
+    s3.put_object(
+        Bucket="state-bucket",
+        Key=f"state/{DEFAULT_ACCOUNT}.json",
+        Body=json.dumps(state),
+    )
+
+    assignments_folder = _write_assignment(
+        tmp_path / "assignments",
+        sid="X", target=[DEFAULT_ACCOUNT], policies=["DriftMe"],
+    )
+    policies_folder = _write_policy(tmp_path / "policies", name="DriftMe")
+    args = _build_args(
+        assignments_folder=assignments_folder,
+        policies_folder=policies_folder,
+        state_bucket="state-bucket",
+    )
+
+    drift_count = deploy_module.create_update_customer_managed_policy(args)
+
+    # Drift was observed and signalled.
+    assert drift_count == 1
+
+    # The approved document was restored as the default version.
+    policy = iam.get_policy(PolicyArn=policy_arn)
+    default_version_id = policy["Policy"]["DefaultVersionId"]
+    default_doc = iam.get_policy_version(
+        PolicyArn=policy_arn, VersionId=default_version_id
+    )["PolicyVersion"]["Document"]
+    assert default_doc == DEFAULT_POLICY_DOC
+
+
+@mock_aws
+def test_main_returns_nonzero_when_drift_detected(
+    deploy_module, aws_credentials, tmp_path, monkeypatch
+):
+    """main() must return a non-zero exit code when drift is detected so the
+    CodeBuild stage fails and an operator alarm can fire.
+    """
+    import sys
+    _create_deploy_role()
+    iam = boto3.client("iam", region_name="us-east-1")
+
+    response = iam.create_policy(PolicyName="DriftExit", PolicyDocument=json.dumps(DEFAULT_POLICY_DOC))
+    policy_arn = response["Policy"]["Arn"]
+    iam.tag_policy(PolicyArn=policy_arn, Tags=[{"Key": "cx-mng", "Value": "true"}])
+    iam.create_policy_version(
+        PolicyArn=policy_arn,
+        PolicyDocument=json.dumps({"Version": "2012-10-17",
+                                    "Statement": [{"Effect": "Allow", "Action": "iam:*", "Resource": "*"}]}),
+        SetAsDefault=True,
+    )
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="state-bucket")
+    s3.put_object(
+        Bucket="state-bucket",
+        Key=f"state/{DEFAULT_ACCOUNT}.json",
+        Body=json.dumps({
+            "account_id": DEFAULT_ACCOUNT,
+            "policies": {
+                "DriftExit": {
+                    "policy_hash": deploy_module.policy_hash(DEFAULT_POLICY_DOC),
+                    "version_id": "v1",
+                    "arn": policy_arn,
+                }
+            },
+        }),
+    )
+
+    assignments_folder = _write_assignment(
+        tmp_path / "assignments",
+        sid="X", target=[DEFAULT_ACCOUNT], policies=["DriftExit"],
+    )
+    policies_folder = _write_policy(tmp_path / "policies", name="DriftExit")
+
+    monkeypatch.setattr(sys, "argv", [
+        "customer-managed-deploy.py",
+        "--state-bucket", "state-bucket",
+        "--assignments-folder", assignments_folder,
+        "--policies-folder", policies_folder,
+    ])
+
+    assert deploy_module.main() == 2
+
+
+def test_fetch_current_policy_doc_returns_error_on_access_denied(deploy_module):
+    """When get_policy/get_policy_version raise anything other than
+    NoSuchEntity (e.g. AccessDenied), fetch_current_policy_doc must surface the
+    exception so the caller can treat it as drift. Previously the fast path
+    could be silenced by a member-account admin denying iam:GetPolicyVersion.
+    """
+    class _AccessDenied(Exception):
+        pass
+
+    class _FakeIam:
+        def get_policy(self, PolicyArn):  # noqa: N803
+            raise _AccessDenied("AccessDenied: not authorized to perform iam:GetPolicy")
+
+    doc, err = deploy_module.fetch_current_policy_doc(_FakeIam(), "arn:aws:iam::111111111111:policy/X")
+    assert doc is None
+    assert err is not None
+
+
+@mock_aws
 def test_create_update_skips_existing_policy_without_cxmng_tag(
     deploy_module, aws_credentials, tmp_path
 ):
