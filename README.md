@@ -277,6 +277,25 @@ O diretório [`terraform/`](terraform/) contém uma variante da pipeline equival
 
 ### Deploy
 
+> **Supply-chain pinning.** `terraform/.terraform.lock.hcl` and
+> `terraform/deploy-role/.terraform.lock.hcl` MUST be present and committed
+> before any `terraform apply`. They pin the exact provider build + SHA256
+> hash per platform, so `terraform init` fails closed if the registry serves
+> a different artifact. If a lock file does not exist yet, or you added a
+> new target platform, regenerate it with:
+>
+> ```bash
+> cd terraform               # repeat in terraform/deploy-role/
+> terraform providers lock \
+>     -platform=linux_amd64 \
+>     -platform=darwin_amd64 \
+>     -platform=darwin_arm64
+> git add .terraform.lock.hcl
+> ```
+>
+> On every subsequent machine use `terraform init -lockfile=readonly` so
+> init refuses to upgrade or add hashes silently.
+
 ```bash
 cd terraform
 
@@ -284,8 +303,8 @@ cd terraform
 cp terraform.tfvars.example terraform.tfvars
 # edite terraform.tfvars e defina o external_id (openssl rand -hex 32)
 
-# 2) Inicializar e revisar o plano
-terraform init
+# 2) Inicializar e revisar o plano (lockfile=readonly: falha se o hash divergir)
+terraform init -lockfile=readonly
 terraform plan
 
 # 3) Aplicar
@@ -296,7 +315,7 @@ Depois, crie a role nas contas-alvo (uma vez por conta), usando o **mesmo `exter
 
 ```bash
 cd terraform/deploy-role
-terraform init
+terraform init -lockfile=readonly
 terraform apply \
   -var="pipeline_account_id=<ID_DA_CONTA_DO_PIPELINE>" \
   -var="external_id=<MESMO_EXTERNAL_ID>"
@@ -480,8 +499,35 @@ A pipeline tem **120 testes** pytest. A suite roda em **~5 segundos** local, sem
 cd cloudformation/iam-cx-mng-pipeline-main
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
+
+# Reproducible / hash-pinned install (recommended on any host that holds
+# AWS credentials). requirements-dev.lock is produced by pip-compile
+# --generate-hashes from requirements-dev.txt and must be committed.
+pip install --require-hashes -r requirements-dev.lock
+
+# Abstract/unpinned install (local experimentation only, NEVER on a host
+# with deploy credentials): pip install -r requirements-dev.txt
 ```
+
+#### Regenerating the Python lock files
+
+`requirements.txt` and `requirements-dev.txt` are the abstract input
+(version ranges). The authoritative pinned set lives in `requirements.lock`
+and `requirements-dev.lock` and MUST be committed. Regenerate after any
+change to the `.txt` inputs:
+
+```bash
+python3 -m venv .venv-pip-tools
+source .venv-pip-tools/bin/activate
+pip install pip-tools   # pin pip-tools itself in a hashed lock in CI
+pip-compile --generate-hashes --output-file=requirements.lock      requirements.txt
+pip-compile --generate-hashes --output-file=requirements-dev.lock  requirements-dev.txt
+```
+
+CI and operators then install exclusively with
+`pip install --require-hashes -r requirements-dev.lock` (or
+`requirements.lock` for runtime-only hosts), which fails closed on any
+artifact whose SHA256 does not match the committed lock.
 
 ### Distribuição por arquivo
 

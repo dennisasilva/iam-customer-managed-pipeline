@@ -42,7 +42,10 @@ cdk.out/
 
 # Terraform
 .terraform/
-.terraform.lock.hcl
+# NOTE: .terraform.lock.hcl is intentionally committed (supply-chain pinning).
+# Regenerate for every target platform with:
+#   terraform providers lock -platform=linux_amd64 -platform=darwin_amd64 -platform=darwin_arm64
+# See README.md (section "Reproducible / hash-pinned installs").
 *.tfstate
 *.tfstate.*
 crash.log
