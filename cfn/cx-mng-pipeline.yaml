@@ -32,13 +32,12 @@
       ConstraintDescription: "Must be either GitHub or GitLab"
 
     S3BucketCodeBucket:
-      Description: 'S3 bucket with the initial repository code. Must be created in advance.'
+      Description: 'S3 bucket with the initial repository code. Must be created in advance, owned by the deploying account, use an account-specific name (do NOT use a generic/globally-guessable name), have BlockPublicAccess enabled, versioning enabled, and a bucket policy restricting s3:PutObject to release automation.'
       Type: String
-      Default: 'iam-cx-mng-pipeline-initialcode'
       MinLength: 3
       MaxLength: 63
       AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
-      ConstraintDescription: 'Bucket name must be 3-63 chars, lowercase letters, numbers, dots and hyphens; must start and end with a letter or number.'
+      ConstraintDescription: 'Bucket name must be 3-63 chars, lowercase letters, numbers, dots and hyphens; must start and end with a letter or number. No default is provided to avoid globally-guessable bucket name squatting (CWE-494): supply an account-specific value.'
 
     S3BucketCodeKey:
       Description: 'Name of the zip file with the repository initial code hosted in S3 bucket above'
@@ -48,6 +47,14 @@
       MaxLength: 1024
       AllowedPattern: '^[A-Za-z0-9._/-]+\.zip$'
       ConstraintDescription: 'S3 key must end with .zip and contain only letters, numbers, dots, underscores, slashes and hyphens.'
+
+    S3BucketCodeObjectVersion:
+      Description: 'S3 ObjectVersion of the initial repository code zip. REQUIRED to pin the exact artifact used to bootstrap the GitHub repository and prevent silent swap of the code (CWE-494: Download of Code Without Integrity Check). Obtain it with: aws s3api list-object-versions --bucket <S3BucketCodeBucket> --prefix <S3BucketCodeKey> --query ''Versions[?IsLatest].VersionId'' --output text. Enable versioning on the bootstrap bucket before uploading the zip.'
+      Type: String
+      MinLength: 1
+      MaxLength: 1024
+      AllowedPattern: '^[A-Za-z0-9._-]+$'
+      ConstraintDescription: 'ObjectVersion must be the S3 VersionId of the uploaded zip (letters, numbers, dot, underscore, hyphen).'
 
     RepositoryName:
       Description: 'Name of the GitHub repository'
@@ -158,6 +165,14 @@
           S3:
             Bucket: !Ref S3BucketCodeBucket
             Key: !Ref S3BucketCodeKey
+            # Pin the exact S3 object version used to bootstrap the GitHub
+            # repository (CWE-494). Without ObjectVersion the resource would
+            # consume whatever object currently occupies the key, allowing a
+            # principal with s3:PutObject on the bootstrap bucket (or a
+            # successful global-namespace squat on an unmanaged bucket name)
+            # to silently replace the code that every downstream CodeBuild
+            # stage then executes with cross-account IAM privileges.
+            ObjectVersion: !Ref S3BucketCodeObjectVersion
         EnableIssues: true
         IsPrivate: true
         RepositoryAccessToken: !Sub '{{resolve:secretsmanager:${SecretId}::::}}'
