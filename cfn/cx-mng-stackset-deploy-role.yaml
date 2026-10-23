@@ -57,14 +57,12 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Read + create actions. CreatePolicy cannot be gated by a tag
-              # condition because the policy (and therefore its tag) does not
-              # exist yet at create time; the deploy script applies cx-mng:true
-              # immediately afterwards via TagPolicy.
-              - Sid: IAMPolicyReadAndCreate
+              # Read-only actions. Unconditioned because they neither mutate
+              # IAM nor leak secrets beyond what the pipeline needs for
+              # drift detection and reconciliation.
+              - Sid: IAMPolicyRead
                 Effect: Allow
                 Action:
-                  - iam:CreatePolicy
                   - iam:GetPolicy
                   - iam:GetPolicyVersion
                   - iam:GetRole
@@ -74,22 +72,68 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
                   - !Sub 'arn:aws:iam::${AWS::AccountId}:role/deploy-customer-managed-policy'
-              # Destructive / mutating actions are restricted to policies that
-              # already carry the cx-mng:true tag. This makes IAM (not just the
-              # deploy script) the enforcement point: even a buggy or tampered
-              # script cannot delete/modify policies the pipeline does not own.
+              # CreatePolicy is only allowed when the request itself establishes
+              # the cx-mng:true ownership tag. The deploy script passes Tags=
+              # on CreatePolicy, so authorization sees aws:RequestTag/cx-mng=true
+              # and the newly minted policy is born inside the management
+              # boundary. Without this gate, an attacker who can call this role
+              # could mint untagged policies outside the pipeline's reach.
+              - Sid: IAMPolicyCreateOnlyTagged
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestTag/cx-mng': 'true'
+              # Destructive / mutating actions that do NOT change tags are
+              # restricted to policies that already carry the cx-mng:true tag.
+              # This makes IAM (not just the deploy script) the enforcement
+              # point: even a buggy or tampered script cannot delete/modify
+              # policies the pipeline does not own.
               - Sid: IAMPolicyModifyOnlyTagged
                 Effect: Allow
                 Action:
                   - iam:CreatePolicyVersion
                   - iam:DeletePolicy
                   - iam:DeletePolicyVersion
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/cx-mng': 'true'
+              # TagPolicy keeps the ResourceTag gate (only touch policies we
+              # already own) and additionally forbids rewriting the ownership
+              # key to anything but 'true': if a request includes cx-mng, it
+              # must still be cx-mng=true after the call. StringEqualsIfExists
+              # lets the deploy role add other tags without being forced to
+              # repeat cx-mng in every request.
+              - Sid: IAMPolicyTagOnlyTagged
+                Effect: Allow
+                Action:
                   - iam:TagPolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/cx-mng': 'true'
+                  StringEqualsIfExists:
+                    'aws:RequestTag/cx-mng': 'true'
+              # UntagPolicy keeps the ResourceTag gate and additionally forbids
+              # removing the cx-mng key itself: aws:TagKeys is the set of keys
+              # the request is targeting, and ForAllValues:StringNotEquals
+              # denies the call if ANY of them equals 'cx-mng'. Combined with
+              # IAMPolicyTagOnlyTagged this makes the ownership tag immutable
+              # from this role's perspective.
+              - Sid: IAMPolicyUntagOnlyTagged
+                Effect: Allow
+                Action:
                   - iam:UntagPolicy
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
                 Condition:
                   StringEquals:
                     'aws:ResourceTag/cx-mng': 'true'
+                  ForAllValues:StringNotEquals:
+                    'aws:TagKeys':
+                      - 'cx-mng'
       Tags:
         - Key: cx-mng
           Value: 'true'

@@ -90,14 +90,12 @@ resource "aws_iam_role_policy" "deploy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # Leitura + criação. CreatePolicy não pode ser restrito por tag porque
-      # a policy (e a tag) ainda não existem no momento da criação; o script
-      # aplica cx-mng:true logo em seguida via TagPolicy.
+      # Leitura (read-only). Sem condição: não muta IAM e é necessário
+      # para detecção de drift e reconciliação.
       {
-        Sid    = "IAMPolicyReadAndCreate"
+        Sid    = "IAMPolicyRead"
         Effect = "Allow"
         Action = [
-          "iam:CreatePolicy",
           "iam:GetPolicy",
           "iam:GetPolicyVersion",
           "iam:GetRole",
@@ -110,8 +108,22 @@ resource "aws_iam_role_policy" "deploy" {
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/deploy-customer-managed-policy",
         ]
       },
-      # Ações destrutivas/mutantes só em policies que já têm cx-mng:true.
-      # Faz do IAM (não só do script) o ponto de enforcement.
+      # CreatePolicy só é permitido quando a própria requisição já define
+      # cx-mng:true. O script passa Tags= em CreatePolicy, então o IAM
+      # autoriza com aws:RequestTag/cx-mng=true e a policy já nasce
+      # dentro do boundary de gestão do pipeline. Sem este gate seria
+      # possível mintar policies privilegiadas fora do alcance do pipeline.
+      {
+        Sid      = "IAMPolicyCreateOnlyTagged"
+        Effect   = "Allow"
+        Action   = ["iam:CreatePolicy"]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals = { "aws:RequestTag/cx-mng" = "true" }
+        }
+      },
+      # Ações destrutivas que NÃO mudam tags: só em policies que já têm
+      # cx-mng:true. IAM (não apenas o script) é o ponto de enforcement.
       {
         Sid    = "IAMPolicyModifyOnlyTagged"
         Effect = "Allow"
@@ -119,11 +131,38 @@ resource "aws_iam_role_policy" "deploy" {
           "iam:CreatePolicyVersion",
           "iam:DeletePolicy",
           "iam:DeletePolicyVersion",
-          "iam:TagPolicy",
-          "iam:UntagPolicy",
         ]
         Resource  = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
         Condition = { StringEquals = { "aws:ResourceTag/cx-mng" = "true" } }
+      },
+      # TagPolicy: mantém o gate por ResourceTag E impede reescrever o
+      # cx-mng com outro valor. StringEqualsIfExists permite adicionar
+      # outras tags sem precisar repetir cx-mng na requisição.
+      {
+        Sid      = "IAMPolicyTagOnlyTagged"
+        Effect   = "Allow"
+        Action   = ["iam:TagPolicy"]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals         = { "aws:ResourceTag/cx-mng" = "true" }
+          StringEqualsIfExists = { "aws:RequestTag/cx-mng" = "true" }
+        }
+      },
+      # UntagPolicy: mantém o gate por ResourceTag E impede remover a
+      # própria tag cx-mng (aws:TagKeys contém as chaves que a requisição
+      # está removendo). Combinado com IAMPolicyTagOnlyTagged, a tag de
+      # ownership é imutável para esta role.
+      {
+        Sid      = "IAMPolicyUntagOnlyTagged"
+        Effect   = "Allow"
+        Action   = ["iam:UntagPolicy"]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/cx-mng" = "true" }
+          "ForAllValues:StringNotEquals" = {
+            "aws:TagKeys" = ["cx-mng"]
+          }
+        }
       },
     ]
   })

@@ -295,10 +295,18 @@ def get_iam_client(account_id: str):
 # --------------------------------------------------------------------------- #
 
 
-def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
-    """Iterate every assignment and create or update each policy on each target account."""
+def create_update_customer_managed_policy(args: argparse.Namespace) -> int:
+    """Iterate every assignment and create or update each policy on each target account.
+
+    Returns the number of *fatal* create-path failures encountered. The caller
+    (``main``) propagates a non-zero exit code when this is > 0 so the pipeline
+    stage fails instead of silently leaving orphan/untagged policies behind.
+    Non-fatal per-policy errors on the update path keep being logged and skipped
+    as before.
+    """
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    create_failures = 0
 
     for assignment_file in os.listdir(args.assignments_folder):
         if not assignment_file.endswith(".json"):
@@ -407,18 +415,42 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                             LOG.info("[%s] '%s' updated.", account_id, policy_name)
 
                     except iam.exceptions.NoSuchEntityException:
-                        # Policy does not exist yet → create it.
+                        # Policy does not exist yet → create it. Tag at create time
+                        # (via the Tags= parameter of CreatePolicy) rather than with a
+                        # separate TagPolicy call: the deploy role's TagPolicy
+                        # permission is gated by aws:ResourceTag/cx-mng=true, which a
+                        # freshly created, still-untagged policy cannot satisfy. The
+                        # matching role template authorizes CreatePolicy only when
+                        # aws:RequestTag/cx-mng=true, so this is the sole code path
+                        # that can establish the ownership marker.
                         LOG.info("%s[%s] CREATE '%s'", log_prefix, account_id, policy_name)
                         if not args.dry_run:
-                            response = iam.create_policy(
-                                PolicyName=policy_name,
-                                Path=path,
-                                PolicyDocument=json.dumps(policy_document),
-                                Description=description,
+                            tags_to_apply = (
+                                [{"Key": "cx-mng", "Value": "true"}] + policy_tags
                             )
+                            try:
+                                response = iam.create_policy(
+                                    PolicyName=policy_name,
+                                    Path=path,
+                                    PolicyDocument=json.dumps(policy_document),
+                                    Description=description,
+                                    Tags=tags_to_apply,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                # Fatal on the create path: a half-created or
+                                # un-tagged policy escapes the cx-mng management
+                                # boundary forever (update/delete reconciliation
+                                # both skip anything without cx-mng:true), so we
+                                # must fail the stage instead of logging-and-
+                                # continuing. Count the failure and keep going so
+                                # the operator sees every bad policy in one run.
+                                LOG.error(
+                                    "[%s] FATAL create failure on '%s': %s",
+                                    account_id, policy_name, exc,
+                                )
+                                create_failures += 1
+                                continue
                             policy_arn = response["Policy"]["Arn"]
-                            tags_to_apply = [{"Key": "cx-mng", "Value": "true"}] + policy_tags
-                            iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
 
                             policies_state[policy_name] = {
                                 "arn": policy_arn,
@@ -435,6 +467,8 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                     state["account_id"] = account_id
                     state["policies"] = policies_state
                     save_state(s3_client, account_id, state, args.state_bucket)
+
+    return create_failures
 
 
 # --------------------------------------------------------------------------- #
@@ -552,10 +586,22 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update first, then delete.
+
+    Returns a non-zero exit code when the create path hit any fatal failure,
+    so the CodeBuild stage fails loudly instead of silently leaving an
+    un-tagged policy outside the cx-mng management boundary. Per-policy
+    update errors continue to be logged and skipped.
+    """
     args = parse_args()
-    create_update_customer_managed_policy(args)
+    create_failures = create_update_customer_managed_policy(args)
     delete_customer_managed_policy(args)
+    if create_failures:
+        LOG.error(
+            "Create path failed for %d policy/policies. Failing the stage.",
+            create_failures,
+        )
+        return 1
     return 0
 
 
