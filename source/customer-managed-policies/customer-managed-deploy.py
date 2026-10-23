@@ -54,6 +54,12 @@ logging.basicConfig(
 LOG = logging.getLogger(__name__)
 
 
+# Per-account failures accumulated by phase 1 / phase 2. Populated by the
+# per-account try/except blocks so main() can exit non-zero when a bogus or
+# unreachable account was skipped, without aborting the rest of the run.
+_ACCOUNT_FAILURES: list = []
+
+
 # botocore client config used everywhere in this script:
 #   * 10s connect / 30s read timeouts so a single unreachable account does not
 #     stall the build until the CodeBuild TimeoutInMinutes (480) kicks in.
@@ -69,7 +75,16 @@ BOTO3_CONFIG = Config(
 # AWS account IDs are exactly 12 digits. Defense-in-depth: the upstream
 # TemplateValidation stage already enforces this, but if this script is run
 # locally or that stage is skipped, we re-validate before any STS call.
-ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+#
+# ``re.ASCII`` restricts ``\d`` to [0-9] so full-width / Arabic-Indic digit
+# strings do not satisfy the pattern. ``fullmatch`` is used at the call site
+# so a trailing newline (which ``$`` would tolerate) is also rejected.
+ACCOUNT_ID_PATTERN = re.compile(r"\d{12}", re.ASCII)
+
+# Exact S3 key pattern for per-account state files. Only ``state/<12 ASCII
+# digits>.json`` is accepted; keys with extra prefixes/suffixes, non-ASCII
+# digits, or wrong lengths are ignored.
+_STATE_KEY_PATTERN = re.compile(r"state/(\d{12})\.json", re.ASCII)
 
 
 # Default location of the JSON templates relative to this script's CWD. The
@@ -139,7 +154,7 @@ def _validate_account_id(account_id, context: str) -> None:
     file + SID), so the error message points the operator at the offending
     JSON entry instead of just the value.
     """
-    if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id)):
+    if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.fullmatch(account_id)):
         raise ValueError(
             f"Invalid Target account ID {account_id!r} in {context}. "
             f"Must be exactly 12 digits "
@@ -318,8 +333,19 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
             for account_id in target_accounts:
                 _validate_account_id(account_id, context=f"{assignment_file}#{sid}")
                 LOG.info("%sProcessing account: %s", log_prefix, account_id)
-                iam = get_iam_client(account_id)
-                state = load_state(s3_client, account_id, args.state_bucket) if s3_client else {}
+                try:
+                    iam = get_iam_client(account_id)
+                    state = (
+                        load_state(s3_client, account_id, args.state_bucket)
+                        if s3_client else {}
+                    )
+                except Exception as exc:  # noqa: BLE001 - must not abort other accounts
+                    LOG.error(
+                        "[%s] Could not prepare account for create/update: %s",
+                        account_id, exc,
+                    )
+                    _ACCOUNT_FAILURES.append((account_id, "create_update", str(exc)))
+                    continue
                 policies_state = state.get("policies", {})
 
                 for policy_file in os.listdir(args.policies_folder):
@@ -451,11 +477,17 @@ def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
         accounts: set = set()
         for obj in response.get("Contents", []):
             key = obj["Key"]
-            if not key.endswith(".json"):
+            # Only accept exactly ``state/<12 ASCII digits>.json``. Anything
+            # else (short/long IDs, non-ASCII digits, nested prefixes like
+            # ``state/state/<id>.json``) is skipped so it cannot drive a
+            # sts:AssumeRole / IAM delete sweep.
+            match = _STATE_KEY_PATTERN.fullmatch(key)
+            if match is None:
+                LOG.warning(
+                    "Ignoring unexpected object under state/ prefix: %r", key,
+                )
                 continue
-            account_id = key.replace("state/", "").replace(".json", "")
-            if account_id.isdigit():
-                accounts.add(account_id)
+            accounts.add(match.group(1))
         return accounts
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Could not list state objects in S3: %s", exc)
@@ -498,11 +530,22 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
     for account_id in all_accounts_to_check:
         # For accounts that were removed, no policy should remain.
         keep_for_account = policies_per_account.get(account_id, set())
-        iam = get_iam_client(account_id)
-        state = load_state(s3_client, account_id, args.state_bucket) if s3_client else {}
+        try:
+            iam = get_iam_client(account_id)
+            state = (
+                load_state(s3_client, account_id, args.state_bucket)
+                if s3_client else {}
+            )
+            response = iam.list_policies(Scope="Local")
+        except Exception as exc:  # noqa: BLE001 - one bogus account must not abort the sweep
+            LOG.error(
+                "[%s] Could not list policies for cleanup, skipping: %s",
+                account_id, exc,
+            )
+            _ACCOUNT_FAILURES.append((account_id, "delete", str(exc)))
+            continue
         policies_state = state.get("policies", {})
 
-        response = iam.list_policies(Scope="Local")
         for policy in response["Policies"]:
             policy_name = policy["PolicyName"]
             policy_arn = policy["Arn"]
@@ -552,10 +595,24 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update first, then delete.
+
+    Returns 0 on success. Returns 1 when at least one account could not be
+    prepared (STS/IAM failure before the per-policy loop); the rest of the
+    run still completes so a single unreachable or bogus account cannot
+    abort cleanup for every other account.
+    """
     args = parse_args()
+    # Reset so repeated main() calls in tests do not inherit prior state.
+    _ACCOUNT_FAILURES.clear()
     create_update_customer_managed_policy(args)
     delete_customer_managed_policy(args)
+    if _ACCOUNT_FAILURES:
+        LOG.error(
+            "Completed with %d per-account failures: %s",
+            len(_ACCOUNT_FAILURES), _ACCOUNT_FAILURES,
+        )
+        return 1
     return 0
 
 
