@@ -35,7 +35,8 @@ Usage:
 import argparse
 import sys
 from dataclasses import dataclass, field
-from typing import Callable
+from enum import Enum
+from typing import Callable, Union
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -51,8 +52,34 @@ HEALTHY_STACK_STATUSES = {
 # CodeStar Connection states that allow the pipeline to function.
 HEALTHY_CONNECTION_STATUSES = {"AVAILABLE"}
 # PENDING is the expected state right after stack creation, before the operator
-# completes the OAuth handshake in the AWS console. We warn but do not fail.
+# completes the OAuth handshake in the AWS console. We warn but do not count
+# PENDING as a passing check — the Source stage cannot run until the operator
+# completes the handshake, so the aggregate verdict must not report the stack
+# as fully healthy.
 WARN_CONNECTION_STATUSES = {"PENDING"}
+
+# Logical IDs of the CodeStar Connection resources in cfn/cx-mng-pipeline.yaml.
+# One of these is created depending on the RepositoryType parameter.
+CODESTAR_CONNECTION_LOGICAL_IDS = (
+    "CodeStarConnectionGitHub",
+    "CodeStarConnectionGitLab",
+)
+
+
+class CheckOutcome(Enum):
+    """Tri-state result for an individual check.
+
+    ``PASS``  — the check succeeded.
+    ``WARN``  — the check surfaced a non-fatal operational issue the operator
+                 must address (e.g. a CodeStar Connection waiting for the
+                 OAuth handshake). It is NOT counted toward the aggregate
+                 "all checks passed / stack is operationally healthy" verdict.
+    ``FAIL``  — the check failed.
+    """
+
+    PASS = "PASS"
+    WARN = "WARN"
+    FAIL = "FAIL"
 
 
 # --------------------------------------------------------------------------- #
@@ -64,8 +91,17 @@ WARN_CONNECTION_STATUSES = {"PENDING"}
 class CheckResult:
     """Outcome of a single check, used for the final summary."""
     name: str
-    passed: bool
+    outcome: CheckOutcome
     message: str = ""
+
+    @property
+    def passed(self) -> bool:
+        """Backward-compatible: True only for a strict PASS (not WARN)."""
+        return self.outcome is CheckOutcome.PASS
+
+    @property
+    def warned(self) -> bool:
+        return self.outcome is CheckOutcome.WARN
 
 
 def _print_banner(stack_name: str, region: str, naming: str, bucket_name: str) -> None:
@@ -100,17 +136,35 @@ def _print_check_intro(checking: str, why: str, on_failure: str) -> None:
     print(f"    Failure  : {on_failure}")
 
 
-def _run_check(label: str, fn: Callable[[], bool], results: list) -> None:
-    """Run ``fn``, log PASS/FAIL, and append a CheckResult."""
+def _run_check(
+    label: str,
+    fn: Callable[[], Union[bool, CheckOutcome]],
+    results: list,
+) -> None:
+    """Run ``fn``, log PASS/WARN/FAIL, and append a CheckResult.
+
+    ``fn`` may return either a bool (legacy two-state check) or a
+    :class:`CheckOutcome` (tri-state check).
+    """
     try:
-        passed = fn()
-        marker = "✅ PASS" if passed else "❌ FAIL"
+        raw = fn()
+        if isinstance(raw, CheckOutcome):
+            outcome = raw
+        else:
+            outcome = CheckOutcome.PASS if raw else CheckOutcome.FAIL
+        marker = {
+            CheckOutcome.PASS: "✅ PASS",
+            CheckOutcome.WARN: "⚠️  WARN",
+            CheckOutcome.FAIL: "❌ FAIL",
+        }[outcome]
         print(f"    Result   : {marker} - {label}")
-        results.append(CheckResult(name=label, passed=passed))
+        results.append(CheckResult(name=label, outcome=outcome))
     except (ClientError, BotoCoreError) as exc:
         print(f"    Result   : ❌ FAIL - {label}")
         print(f"               {exc}")
-        results.append(CheckResult(name=label, passed=False, message=str(exc)))
+        results.append(
+            CheckResult(name=label, outcome=CheckOutcome.FAIL, message=str(exc))
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,27 +245,119 @@ def check_artifact_bucket_versioning(s3, bucket_name: str) -> bool:
     return response.get("Status") == "Enabled"
 
 
-def check_codestar_connection(codeconnections, naming_filter: str) -> bool:
-    """A CodeStar Connection should exist matching the stack's naming."""
-    response = codeconnections.list_connections()
-    connections = response.get("Connections", [])
-    matching = [c for c in connections if naming_filter in c.get("ConnectionName", "")]
-    if not matching:
-        print(f"               No CodeStar Connection matching {naming_filter!r}")
-        return False
-    for conn in matching:
-        status = conn["ConnectionStatus"]
-        print(f"               Connection {conn['ConnectionName']}: {status}")
-        if status in HEALTHY_CONNECTION_STATUSES:
-            return True
-        if status in WARN_CONNECTION_STATUSES:
-            print(
-                "               WARNING: connection is PENDING — operator must "
-                "complete the OAuth handshake in the AWS console before the "
-                "Source stage can run."
-            )
-            return True  # PENDING is expected immediately after first deploy
-    return False
+def _resolve_stack_connection_arn(cfn, codepipeline, stack_name: str) -> str:
+    """Return the ConnectionArn the stack actually uses.
+
+    Preference order:
+
+    1. The physical resource id of ``CodeStarConnectionGitHub`` or
+       ``CodeStarConnectionGitLab`` on the stack (one of them exists depending
+       on the RepositoryType parameter — see cfn/cx-mng-pipeline.yaml).
+    2. Falling back to the ``ConnectionArn`` configured on the pipeline's
+       Source action (cfn/cx-mng-pipeline.yaml:742).
+
+    Raises :class:`LookupError` if neither resolution path finds a connection.
+    """
+    paginator = cfn.get_paginator("describe_stack_resources")
+    # describe_stack_resources is not paginated server-side, but using the
+    # paginator keeps the code uniform and future-proof.
+    seen_logical_ids: list[str] = []
+    try:
+        pages = paginator.paginate(StackName=stack_name)
+    except (ClientError, BotoCoreError):
+        pages = [cfn.describe_stack_resources(StackName=stack_name)]
+    for page in pages:
+        for resource in page.get("StackResources", []):
+            logical_id = resource.get("LogicalResourceId", "")
+            seen_logical_ids.append(logical_id)
+            if (
+                logical_id in CODESTAR_CONNECTION_LOGICAL_IDS
+                and resource.get("ResourceType")
+                == "AWS::CodeStarConnections::Connection"
+            ):
+                arn = resource.get("PhysicalResourceId")
+                if arn:
+                    return arn
+
+    # Fallback: read the pipeline's Source action ConnectionArn configuration.
+    pipeline_name = f"{stack_name}-pipeline"
+    try:
+        pipeline = codepipeline.get_pipeline(name=pipeline_name)["pipeline"]
+    except (ClientError, BotoCoreError) as exc:
+        raise LookupError(
+            f"Could not resolve CodeStar ConnectionArn: stack {stack_name!r} "
+            f"has no {CODESTAR_CONNECTION_LOGICAL_IDS} resource and the "
+            f"pipeline lookup failed: {exc}"
+        ) from exc
+    for stage in pipeline.get("stages", []):
+        for action in stage.get("actions", []):
+            config = action.get("configuration", {}) or {}
+            arn = config.get("ConnectionArn")
+            if arn:
+                return arn
+    raise LookupError(
+        f"Could not resolve CodeStar ConnectionArn for stack {stack_name!r}: "
+        f"neither {CODESTAR_CONNECTION_LOGICAL_IDS} resource found on the "
+        f"stack nor a ConnectionArn in pipeline {pipeline_name!r}."
+    )
+
+
+def check_codestar_connection(
+    codeconnections,
+    naming_filter: str,
+    *,
+    cfn=None,
+    codepipeline=None,
+) -> CheckOutcome:
+    """Check the CodeStar Connection the stack actually created.
+
+    Resolves the exact ConnectionArn from the stack's ``CodeStarConnection*``
+    resource (or, as a fallback, from the pipeline's Source action) and calls
+    ``get_connection`` on that ARN. Only ``AVAILABLE`` is reported as a PASS;
+    ``PENDING`` is a non-fatal WARN that is excluded from the aggregate
+    "stack is operationally healthy" verdict (operator must complete the
+    OAuth handshake). Any other status (``ERROR`` and the like) is a FAIL.
+
+    ``naming_filter`` is the stack name — kept for backwards compatibility
+    with the previous signature and used to resolve the stack's resources.
+    ``cfn`` and ``codepipeline`` are keyword-only clients used for ARN
+    resolution; when omitted, they default to boto3 clients in the current
+    session/region so that direct callers still work.
+    """
+    if cfn is None:
+        cfn = boto3.client("cloudformation")
+    if codepipeline is None:
+        codepipeline = boto3.client("codepipeline")
+
+    try:
+        connection_arn = _resolve_stack_connection_arn(
+            cfn, codepipeline, naming_filter
+        )
+    except LookupError as exc:
+        print(f"               {exc}")
+        return CheckOutcome.FAIL
+
+    response = codeconnections.get_connection(ConnectionArn=connection_arn)
+    conn = response.get("Connection", {})
+    name = conn.get("ConnectionName", connection_arn)
+    status = conn.get("ConnectionStatus", "UNKNOWN")
+    print(f"               Connection {name} ({connection_arn}): {status}")
+
+    if status in HEALTHY_CONNECTION_STATUSES:
+        return CheckOutcome.PASS
+    if status in WARN_CONNECTION_STATUSES:
+        print(
+            "               WARNING: connection is PENDING — operator must "
+            "complete the OAuth handshake in the AWS console before the "
+            "Source stage can run. This check is reported as WARN and is "
+            "excluded from the 'all checks passed' verdict."
+        )
+        return CheckOutcome.WARN
+    print(
+        f"               Connection status {status!r} is neither AVAILABLE "
+        f"nor PENDING — the Source stage cannot run."
+    )
+    return CheckOutcome.FAIL
 
 
 # --------------------------------------------------------------------------- #
@@ -422,16 +568,18 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
     )
 
     # ------------------------------------------------------------ #
-    # 14. CodeStar Connection (informational — listed last because PENDING is OK)
+    # 14. CodeStar Connection (reported last; PENDING is a non-fatal WARN)
     # ------------------------------------------------------------ #
     _print_section("info", "CodeStar Connection")
     _print_check_intro(
         checking=f"A CodeStar Connection matching '{stack}' exists",
         why=(
             "The Source stage uses this connection to pull from GitHub. "
-            "PENDING right after first deploy is normal — the operator must "
-            "complete the OAuth handshake in the AWS console before the "
-            "pipeline can run."
+            "PENDING right after first deploy is expected but means the "
+            "OAuth handshake is incomplete and the Source stage cannot run; "
+            "it is reported as WARN and excluded from the aggregate 'stack "
+            "is operationally healthy' verdict until the operator completes "
+            "the handshake in the AWS console."
         ),
         on_failure=(
             "AWS Console > Developer Tools > Settings > Connections. "
@@ -439,8 +587,10 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
         ),
     )
     _run_check(
-        "CodeStar Connection in AVAILABLE or PENDING state",
-        lambda: check_codestar_connection(codeconnections, stack),
+        "CodeStar Connection in AVAILABLE state (PENDING → WARN)",
+        lambda: check_codestar_connection(
+            codeconnections, stack, cfn=cfn, codepipeline=codepipeline
+        ),
         results,
     )
 
@@ -452,19 +602,37 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
     print("  Summary")
     print("=" * 72)
     total = len(results)
-    passed = sum(1 for r in results if r.passed)
-    failed = total - passed
+    passed = sum(1 for r in results if r.outcome is CheckOutcome.PASS)
+    warned = sum(1 for r in results if r.outcome is CheckOutcome.WARN)
+    failed = sum(1 for r in results if r.outcome is CheckOutcome.FAIL)
 
     if failed > 0:
         print(f"  {failed}/{total} checks FAILED:")
         for r in results:
-            if not r.passed:
+            if r.outcome is CheckOutcome.FAIL:
                 print(f"     ❌ {r.name}")
                 if r.message:
                     print(f"        {r.message}")
+        if warned > 0:
+            print(f"  {warned}/{total} checks reported WARN:")
+            for r in results:
+                if r.outcome is CheckOutcome.WARN:
+                    print(f"     ⚠️  {r.name}")
         print()
         print("  Smoke test FAILED — review the [Failure] hints above before")
         print("  trying to use the pipeline.")
+        return 1
+
+    if warned > 0:
+        print(f"  {passed}/{total} checks passed, {warned}/{total} WARN:")
+        for r in results:
+            if r.outcome is CheckOutcome.WARN:
+                print(f"     ⚠️  {r.name}")
+        print()
+        print("  Smoke test completed with WARNINGS — the stack is NOT yet")
+        print("  fully operational. Address every WARN above (typically:")
+        print("  complete the CodeStar Connection OAuth handshake in the AWS")
+        print("  console) and re-run this script before using the pipeline.")
         return 1
 
     print(f"  {passed}/{total} checks passed.")
@@ -472,8 +640,6 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
     print("  Smoke test PASSED — the stack is operationally healthy.")
     print()
     print("  Next steps:")
-    print("    * If the CodeStar Connection is PENDING, complete the OAuth")
-    print("      handshake in the AWS console before pushing to GitHub.")
     print("    * Push a commit to the configured branch (BranchName parameter)")
     print("      to trigger the first pipeline run end-to-end.")
     print("    * Watch the CodePipeline console for stage progression.")
