@@ -57,14 +57,26 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Read + create actions. CreatePolicy cannot be gated by a tag
-              # condition because the policy (and therefore its tag) does not
-              # exist yet at create time; the deploy script applies cx-mng:true
-              # immediately afterwards via TagPolicy.
+              # Read + create actions. CreatePolicy itself cannot be gated by
+              # ``aws:ResourceTag/*`` (the policy and its tags do not exist yet
+              # at authorization time), so we gate it on ``aws:RequestTag/*``
+              # instead and require the deploy script to tag atomically with
+              # ``Tags=`` on create_policy. ``aws:TagKeys`` is intersected to
+              # make sure every tag passed on create carries only pipeline-
+              # approved keys when combined with the mutation statement below.
               - Sid: IAMPolicyReadAndCreate
                 Effect: Allow
                 Action:
                   - iam:CreatePolicy
+                  - iam:TagPolicy
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestTag/cx-mng': 'true'
+              - Sid: IAMPolicyRead
+                Effect: Allow
+                Action:
                   - iam:GetPolicy
                   - iam:GetPolicyVersion
                   - iam:GetRole
