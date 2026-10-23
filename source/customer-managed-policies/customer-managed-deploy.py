@@ -206,44 +206,186 @@ def save_state(s3_client, account_id: str, state: dict, state_bucket: str) -> No
         LOG.error("[%s] Could not save state: %s", account_id, exc)
 
 
+def _as_set(value) -> set:
+    """Normalize an IAM policy field to a set.
+
+    IAM policy fields such as ``Action``, ``NotAction``, ``Resource``,
+    ``NotResource`` and (string-form) ``Principal`` are legally either a
+    JSON string or a JSON list of strings. ``set()`` on a bare string
+    iterates its characters, which turns a comparison such as
+    ``s3:GetObject`` vs ``iam:*`` into a meaningless per-character diff
+    (and makes ``s3:Get*`` vs ``s3:*Get`` appear identical). Wrap the
+    value here so every caller gets the same list/string handling.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, list):
+        # Entries are expected to be hashable strings; keep as-is.
+        return set(value)
+    return {value}
+
+
+def _canonical_statement(stmt: dict) -> str:
+    """Return a deterministic JSON representation of a statement.
+
+    Used to detect statements whose content is unchanged across the two
+    documents even when their ``Sid`` was renamed, so a rename is not
+    reported as a spurious ADDED/REMOVED pair.
+    """
+    # Compare on everything except the Sid (which is the key being renamed).
+    body = {k: v for k, v in stmt.items() if k != "Sid"}
+    return json.dumps(body, sort_keys=True, default=str)
+
+
+# Statement fields that are legally string-or-list and must be normalized
+# with ``_as_set`` before comparison. Each entry pairs the policy-document
+# key with the plural label used in the approver-facing log message, so the
+# output stays close to what reviewers have seen historically ("Actions
+# added: …", "Resources removed: …").
+_STRING_OR_LIST_FIELDS = (
+    ("Action", "Actions"),
+    ("NotAction", "NotActions"),
+    ("Resource", "Resources"),
+    ("NotResource", "NotResources"),
+)
+
+
+def _diff_statement(account_id: str, sid: str, old_stmt: dict, new_stmt: dict) -> None:
+    """Log the per-field diff between two statements that share the same Sid."""
+    for field, label in _STRING_OR_LIST_FIELDS:
+        if field not in old_stmt and field not in new_stmt:
+            continue
+        old_values = _as_set(old_stmt.get(field))
+        new_values = _as_set(new_stmt.get(field))
+        added = new_values - old_values
+        removed = old_values - new_values
+        if added:
+            LOG.info("  Statement '%s' %s added: %s", sid, label, sorted(added))
+        if removed:
+            LOG.info("  Statement '%s' %s removed: %s", sid, label, sorted(removed))
+
+    # Effect is a scalar string ("Allow" / "Deny"); report a flip explicitly.
+    old_effect = old_stmt.get("Effect")
+    new_effect = new_stmt.get("Effect")
+    if old_effect != new_effect:
+        LOG.info(
+            "  Statement '%s' Effect changed: %r -> %r", sid, old_effect, new_effect,
+        )
+
+    # Principal may be absent (identity-based policies), the literal string
+    # "*", or a dict mapping principal type ("AWS", "Service", …) to a string
+    # or list. Compare the normalized shape per type so an added principal
+    # is visible to the approver.
+    old_principal = old_stmt.get("Principal")
+    new_principal = new_stmt.get("Principal")
+    if old_principal != new_principal:
+        old_by_type = _principal_by_type(old_principal)
+        new_by_type = _principal_by_type(new_principal)
+        for ptype in sorted(set(old_by_type) | set(new_by_type)):
+            p_added = new_by_type.get(ptype, set()) - old_by_type.get(ptype, set())
+            p_removed = old_by_type.get(ptype, set()) - new_by_type.get(ptype, set())
+            if p_added:
+                LOG.info(
+                    "  Statement '%s' Principal[%s] added: %s",
+                    sid, ptype, sorted(p_added),
+                )
+            if p_removed:
+                LOG.info(
+                    "  Statement '%s' Principal[%s] removed: %s",
+                    sid, ptype, sorted(p_removed),
+                )
+
+    # Condition is a nested dict (operator -> key -> value). Compare on the
+    # canonical JSON so any change is surfaced; the structure is too open-
+    # ended to usefully diff key by key here.
+    old_cond = old_stmt.get("Condition")
+    new_cond = new_stmt.get("Condition")
+    if old_cond != new_cond:
+        LOG.info(
+            "  Statement '%s' Condition changed: %s -> %s",
+            sid,
+            json.dumps(old_cond, sort_keys=True, default=str) if old_cond is not None else "<none>",
+            json.dumps(new_cond, sort_keys=True, default=str) if new_cond is not None else "<none>",
+        )
+
+
+def _principal_by_type(principal) -> dict:
+    """Return a ``{principal_type: set_of_values}`` view of an IAM Principal field."""
+    if principal is None:
+        return {}
+    if isinstance(principal, str):
+        # The literal "*" (anonymous) is the only valid string form.
+        return {"*": {principal}}
+    if isinstance(principal, dict):
+        return {ptype: _as_set(pvals) for ptype, pvals in principal.items()}
+    # Unknown shape — fall back to a stringified single-value bucket so the
+    # change is still reported rather than silently dropped.
+    return {"?": {json.dumps(principal, sort_keys=True, default=str)}}
+
+
 def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict) -> None:
     """Log a per-statement / per-action / per-resource diff between two policy documents."""
     if old_doc == new_doc:
         return
     LOG.info("[%s] DIFF '%s':", account_id, policy_name)
 
-    # Index statements by Sid so we can compare them across both versions.
-    old_stmts = {s.get("Sid", f"stmt-{i}"): s for i, s in enumerate(old_doc.get("Statement", []))}
-    new_stmts = {s.get("Sid", f"stmt-{i}"): s for i, s in enumerate(new_doc.get("Statement", []))}
+    old_statements = list(old_doc.get("Statement", []) or [])
+    new_statements = list(new_doc.get("Statement", []) or [])
 
-    for sid in set(list(old_stmts.keys()) + list(new_stmts.keys())):
+    # First, pair statements whose canonical content is identical even if
+    # the Sid was renamed, so a pure rename does not degrade to a noisy
+    # ADDED/REMOVED pair in the approver's log. Any such pair is unchanged
+    # at the content level and is reported as a rename (or silently skipped
+    # when the Sid is also identical).
+    old_remaining = []
+    old_canonicals = {}  # canonical body -> list of (index, stmt)
+    for i, s in enumerate(old_statements):
+        old_canonicals.setdefault(_canonical_statement(s), []).append((i, s))
+        old_remaining.append(True)
+
+    new_remaining = [True] * len(new_statements)
+    for j, new_stmt in enumerate(new_statements):
+        key = _canonical_statement(new_stmt)
+        bucket = old_canonicals.get(key)
+        while bucket:
+            i, old_stmt = bucket[0]
+            if not old_remaining[i]:
+                bucket.pop(0)
+                continue
+            # Content match: consume both sides.
+            old_remaining[i] = False
+            new_remaining[j] = False
+            old_sid = old_stmt.get("Sid")
+            new_sid = new_stmt.get("Sid")
+            if old_sid != new_sid:
+                LOG.info(
+                    "  Statement renamed: %r -> %r (contents unchanged)",
+                    old_sid, new_sid,
+                )
+            bucket.pop(0)
+            break
+
+    # Index the still-unmatched statements by Sid (falling back to a
+    # positional key when Sid is absent, mirroring the previous behavior).
+    old_stmts = {
+        s.get("Sid", f"stmt-{i}"): s
+        for i, s in enumerate(old_statements)
+        if old_remaining[i]
+    }
+    new_stmts = {
+        s.get("Sid", f"stmt-{j}"): s
+        for j, s in enumerate(new_statements)
+        if new_remaining[j]
+    }
+
+    for sid in sorted(set(old_stmts) | set(new_stmts)):
         if sid not in old_stmts:
             LOG.info("  + Statement '%s' ADDED", sid)
             continue
         if sid not in new_stmts:
             LOG.info("  - Statement '%s' REMOVED", sid)
             continue
-
-        old_actions = set(old_stmts[sid].get("Action", []))
-        new_actions = set(new_stmts[sid].get("Action", []))
-        added = new_actions - old_actions
-        removed = old_actions - new_actions
-        if added:
-            LOG.info("  Statement '%s' Actions added: %s", sid, added)
-        if removed:
-            LOG.info("  Statement '%s' Actions removed: %s", sid, removed)
-
-        # Resource may be either a string or a list — normalize both sides to a set.
-        old_res_field = old_stmts[sid].get("Resource", "")
-        new_res_field = new_stmts[sid].get("Resource", "")
-        old_res = set(old_res_field) if isinstance(old_res_field, list) else {old_res_field}
-        new_res = set(new_res_field) if isinstance(new_res_field, list) else {new_res_field}
-        res_added = new_res - old_res
-        res_removed = old_res - new_res
-        if res_added:
-            LOG.info("  Statement '%s' Resources added: %s", sid, res_added)
-        if res_removed:
-            LOG.info("  Statement '%s' Resources removed: %s", sid, res_removed)
+        _diff_statement(account_id, sid, old_stmts[sid], new_stmts[sid])
 
 
 def get_current_policy_doc(iam_client, policy_arn: str):

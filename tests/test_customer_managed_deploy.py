@@ -93,6 +93,127 @@ def test_diff_policy_reports_added_and_removed_actions(deploy_module, caplog):
     assert "s3:PutObject" in caplog.text
 
 
+def test_diff_policy_handles_string_action_on_both_sides(deploy_module, caplog):
+    """String-form Action must be normalized, not iterated character-by-character.
+
+    This exercises the regression that the fix for diff_policy() addresses:
+    before normalization, ``set('s3:GetObject')`` and ``set('iam:*')`` were
+    character sets, so the approver-facing log reported changes such as
+    ``Actions added: {'a','m','i','*'}`` for a change from a read-only S3
+    permission to full IAM administration. The whole action strings must
+    appear verbatim in the log.
+    """
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{"Sid": "A", "Action": "s3:GetObject"}]}
+    new = {"Statement": [{"Sid": "A", "Action": "iam:*"}]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "Actions added" in caplog.text
+    assert "iam:*" in caplog.text
+    assert "Actions removed" in caplog.text
+    assert "s3:GetObject" in caplog.text
+    # The individual characters of the old string must not leak into the diff.
+    assert "'G'" not in caplog.text
+    assert "'O'" not in caplog.text
+
+
+def test_diff_policy_handles_string_action_mixed_shapes(deploy_module, caplog):
+    """A list-form Action on one side and a string on the other still diffs correctly."""
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{"Sid": "A", "Action": ["s3:GetObject"]}]}
+    new = {"Statement": [{"Sid": "A", "Action": "iam:*"}]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "iam:*" in caplog.text
+    assert "s3:GetObject" in caplog.text
+
+
+def test_diff_policy_detects_same_character_set_action_change(deploy_module, caplog):
+    """``s3:Get*`` -> ``s3:*Get`` have the same character set.
+
+    The pre-fix implementation reported no diff at all for this change
+    because ``set('s3:Get*') == set('s3:*Get')``. After normalization the
+    two whole strings differ and both must be reported.
+    """
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{"Sid": "A", "Action": "s3:Get*"}]}
+    new = {"Statement": [{"Sid": "A", "Action": "s3:*Get"}]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "s3:Get*" in caplog.text
+    assert "s3:*Get" in caplog.text
+
+
+def test_diff_policy_reports_effect_flip(deploy_module, caplog):
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{"Sid": "A", "Effect": "Allow", "Action": ["s3:GetObject"]}]}
+    new = {"Statement": [{"Sid": "A", "Effect": "Deny", "Action": ["s3:GetObject"]}]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "Effect changed" in caplog.text
+    assert "Allow" in caplog.text
+    assert "Deny" in caplog.text
+
+
+def test_diff_policy_reports_condition_change(deploy_module, caplog):
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{
+        "Sid": "A", "Effect": "Allow", "Action": ["s3:GetObject"],
+        "Condition": {"StringEquals": {"aws:username": "alice"}},
+    }]}
+    new = {"Statement": [{
+        "Sid": "A", "Effect": "Allow", "Action": ["s3:GetObject"],
+        "Condition": {"StringEquals": {"aws:username": "bob"}},
+    }]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "Condition changed" in caplog.text
+
+
+def test_diff_policy_rename_only_does_not_report_added_removed(deploy_module, caplog):
+    """A statement whose Sid is renamed but whose content is unchanged is a rename, not ADDED/REMOVED."""
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{"Sid": "OldName", "Effect": "Allow", "Action": ["s3:GetObject"]}]}
+    new = {"Statement": [{"Sid": "NewName", "Effect": "Allow", "Action": ["s3:GetObject"]}]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "ADDED" not in caplog.text
+    assert "REMOVED" not in caplog.text
+    assert "renamed" in caplog.text
+    assert "OldName" in caplog.text
+    assert "NewName" in caplog.text
+
+
+def test_diff_policy_reports_principal_change(deploy_module, caplog):
+    import logging
+    caplog.set_level(logging.INFO)
+
+    old = {"Statement": [{
+        "Sid": "A", "Effect": "Allow", "Action": ["sts:AssumeRole"],
+        "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+    }]}
+    new = {"Statement": [{
+        "Sid": "A", "Effect": "Allow", "Action": ["sts:AssumeRole"],
+        "Principal": {"AWS": ["arn:aws:iam::111111111111:root", "arn:aws:iam::222222222222:root"]},
+    }]}
+    deploy_module.diff_policy("111111111111", "PolicyA", old, new)
+
+    assert "Principal[AWS] added" in caplog.text
+    assert "222222222222" in caplog.text
+
+
 # --------------------------------------------------------------------------- #
 # load_state / save_state — S3 round-trip via moto
 # --------------------------------------------------------------------------- #
