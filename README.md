@@ -123,11 +123,24 @@ aws secretsmanager create-secret \
 
 ### 3. S3 Bucket com código inicial
 
-Crie um bucket S3 e faça upload do arquivo `.zip` com o código que ficará no repositório:
+Crie um bucket S3 **de nome específico da sua conta** (não use nomes genéricos/globalmente adivinháveis como `iam-cx-mng-pipeline-initialcode` — nomes de bucket S3 são um namespace global e podem ser pré-registrados por qualquer principal AWS para servir código malicioso), com **versionamento habilitado**, **BlockPublicAccess** e uma **bucket policy** restringindo `s3:PutObject` à automação de release. Em seguida faça upload do `.zip`, capture o `VersionId` retornado e passe-o como parâmetro `S3BucketCodeObjectVersion` no deploy do stack:
 
 ```bash
-# Criar o bucket
-aws s3 mb s3://iam-cx-mng-pipeline-initialcode --region us-east-1
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BOOTSTRAP_BUCKET="iam-cx-mng-pipeline-initialcode-${ACCOUNT_ID}"   # exemplo — use um nome específico da sua conta
+
+# Criar o bucket (BucketAlreadyExists aborta imediatamente caso o nome esteja em uso em outra conta — não ignore esse erro)
+aws s3 mb "s3://${BOOTSTRAP_BUCKET}" --region us-east-1
+
+# Bloquear acesso público
+aws s3api put-public-access-block \
+  --bucket "${BOOTSTRAP_BUCKET}" \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# Habilitar versionamento (obrigatório: o stack pin o artefato por VersionId)
+aws s3api put-bucket-versioning \
+  --bucket "${BOOTSTRAP_BUCKET}" \
+  --versioning-configuration Status=Enabled
 
 # A partir da raiz do projeto, gerar o zip excluindo arquivos que NÃO devem ir para o repo:
 cd iam-cx-mng-pipeline-main
@@ -145,9 +158,28 @@ zip -r iam-cx-mng-pipeline.zip . \
   -x "requirements-dev.txt" \
   -x "pytest.ini"
 
-# Upload do zip
-aws s3 cp iam-cx-mng-pipeline.zip s3://iam-cx-mng-pipeline-initialcode/
+# Opcional porém recomendado: registre o SHA-256 do artefato antes do upload
+# e compare-o com `aws s3api head-object ... --checksum-mode ENABLED` depois.
+sha256sum iam-cx-mng-pipeline.zip
+
+# Upload do zip (--expected-bucket-owner garante que não estamos escrevendo em um bucket alheio)
+aws s3api put-object \
+  --bucket "${BOOTSTRAP_BUCKET}" \
+  --key iam-cx-mng-pipeline.zip \
+  --body iam-cx-mng-pipeline.zip \
+  --expected-bucket-owner "${ACCOUNT_ID}"
+
+# Capturar o VersionId que será passado para S3BucketCodeObjectVersion
+OBJECT_VERSION=$(aws s3api list-object-versions \
+  --bucket "${BOOTSTRAP_BUCKET}" \
+  --prefix iam-cx-mng-pipeline.zip \
+  --expected-bucket-owner "${ACCOUNT_ID}" \
+  --query 'Versions[?IsLatest].VersionId' \
+  --output text)
+echo "S3BucketCodeObjectVersion=${OBJECT_VERSION}"
 ```
+
+> **Segurança:** o template fixa o artefato por `Code.S3.ObjectVersion` (CWE-494). Não reaproveite nomes de bucket genéricos entre contas e verifique que o `VersionId` passado corresponde ao SHA-256 que você construiu localmente antes de fazer o deploy do stack.
 
 O `.zip` carrega no GitHub apenas o código que a pipeline precisa em runtime — os arquivos de IaC (`cfn/`), testes (`tests/`), scripts auxiliares (`scripts/`) e o README continuam no repositório de origem mas **não** são publicados pelo `AWS::CodeStar::GitHubRepository`.
 
@@ -220,8 +252,9 @@ Todos os parâmetros têm validação de input (`AllowedPattern`, `MinLength`, `
 | Parâmetro | Descrição | Default | Validação |
 |-----------|-----------|---------|-----------|
 | `RepositoryType` | Tipo do repositório (GitHub ou GitLab) | `GitHub` | `AllowedValues: [GitHub, GitLab]` |
-| `S3BucketCodeBucket` | Bucket S3 com o código inicial (.zip) | `iam-cx-mng-pipeline-initialcode` | regex S3 bucket name (3-63 chars) |
+| `S3BucketCodeBucket` | Bucket S3 com o código inicial (.zip). Use um nome específico da conta. | _(sem default — obrigatório)_ | regex S3 bucket name (3-63 chars) |
 | `S3BucketCodeKey` | Nome do arquivo .zip no bucket S3 | `iam-cx-mng-pipeline.zip` | deve terminar em `.zip`, max 1024 chars |
+| `S3BucketCodeObjectVersion` | VersionId S3 do zip inicial (fixa o artefato — CWE-494) | _(sem default — obrigatório)_ | 1-1024 chars `[A-Za-z0-9._-]` |
 | `RepositoryName` | Nome do repositório GitHub | `iam-cx-mng-pipeline` | regex GitHub repo name (max 100 chars) |
 | `RepositoryOwner` | Username do owner do repositório GitHub | `dennisasilva` | regex GitHub username (max 39 chars) |
 | `BranchName` | Branch do repositório que a pipeline rastreia | `main` | regex git branch name (max 250 chars) |
@@ -239,8 +272,9 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     RepositoryType=GitHub \
-    S3BucketCodeBucket=iam-cx-mng-pipeline-initialcode \
+    S3BucketCodeBucket=<ACCOUNT_SPECIFIC_BUCKET_NAME> \
     S3BucketCodeKey=iam-cx-mng-pipeline.zip \
+    S3BucketCodeObjectVersion=<VERSION_ID_FROM_STEP_3> \
     RepositoryName=iam-cx-mng-pipeline \
     RepositoryOwner=dennisasilva \
     BranchName=main \
