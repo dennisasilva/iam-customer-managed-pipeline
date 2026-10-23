@@ -56,6 +56,17 @@ POLICY_PATH_MAX_LENGTH = 512
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
 
+# Tag keys reserved for the pipeline's ownership metadata. Repository
+# templates must NOT declare any of these: the deploy script and the
+# cross-account IAM role use the ``cx-mng`` tag as their only ownership
+# check (see cfn/cx-mng-stackset-deploy-role.yaml Sid
+# IAMPolicyModifyOnlyTagged and source/customer-managed-policies/
+# customer-managed-deploy.py), so overwriting it from a template could
+# orphan a privileged managed policy outside pipeline control.
+RESERVED_TAG_KEY = "cx-mng"
+RESERVED_TAG_KEYS = frozenset({RESERVED_TAG_KEY})
+
+
 def parse_args() -> argparse.Namespace:
     """Parse and return the command-line arguments."""
     parser = argparse.ArgumentParser(description="Customer-managed policies validation")
@@ -156,6 +167,49 @@ def validate_policy_paths(policies: dict) -> None:
     LOG.info("All policy Path values are valid.")
 
 
+def validate_reserved_tags(policies: dict) -> None:
+    """Raise ``ValueError`` if any policy template declares a reserved tag Key.
+
+    The pipeline owns the ``cx-mng`` tag (and any key in
+    :data:`RESERVED_TAG_KEYS`). A template that declares one could overwrite
+    the single attribute the engine and the cross-account role use to
+    authorize mutating actions, orphaning a live privileged policy. Match
+    is case-insensitive on the key to defeat trivial casing bypasses.
+    """
+    errors: list = []
+    for filename, doc in policies.items():
+        tags = doc.get("Tags", [])
+        if not isinstance(tags, list):
+            errors.append(
+                f"{filename}: Tags must be a list, got {type(tags).__name__}"
+            )
+            continue
+        for idx, tag in enumerate(tags):
+            if not isinstance(tag, dict):
+                errors.append(
+                    f"{filename}#Tags[{idx}]: entry must be an object, "
+                    f"got {type(tag).__name__}"
+                )
+                continue
+            key = tag.get("Key")
+            if isinstance(key, str) and key.strip().lower() in RESERVED_TAG_KEYS:
+                errors.append(
+                    f"{filename}#Tags[{idx}]: Key {key!r} is reserved for "
+                    f"the pipeline's ownership metadata and cannot be "
+                    f"declared in a template."
+                )
+
+    if errors:
+        for err in errors:
+            LOG.error(err)
+        raise ValueError(
+            f"Reserved tag key declared in {len(errors)} policy template "
+            f"entry(ies). Remove the reserved Key before re-running the pipeline."
+        )
+
+    LOG.info("No policy templates declare reserved tag keys.")
+
+
 def load_assignment_files(folder: str) -> dict:
     """Load every ``*.json`` file in ``folder`` and return a ``{filename: dict}`` mapping.
 
@@ -253,6 +307,7 @@ def main() -> int:
 
         validate_unique_policy_name(policies)
         validate_policy_paths(policies)
+        validate_reserved_tags(policies)
 
         # Validate Target account IDs only if the assignments folder was given.
         # Loud warning if missing so it does not silently skip.

@@ -73,8 +73,13 @@ def _has_cxmng_tag_condition(statement) -> bool:
 
 
 def test_destructive_actions_require_cxmng_tag_condition(role_statements):
-    """Every destructive IAM action must live in a statement gated by the tag."""
+    """Every destructive IAM action in an Allow must be gated by the tag."""
     for statement in role_statements:
+        if statement.get("Effect") != "Allow":
+            # Deny statements are a *stronger* guard, not a weaker one, and
+            # may legitimately scope on request-side conditions instead of
+            # aws:ResourceTag/cx-mng.
+            continue
         actions = _actions(statement)
         destructive_here = actions & DESTRUCTIVE_ACTIONS
         if destructive_here:
@@ -85,8 +90,10 @@ def test_destructive_actions_require_cxmng_tag_condition(role_statements):
 
 
 def test_no_destructive_action_in_unconditioned_statement(role_statements):
-    """No statement WITHOUT the tag condition may include a destructive action."""
+    """No Allow statement without the tag condition may include a destructive action."""
     for statement in role_statements:
+        if statement.get("Effect") != "Allow":
+            continue
         if _has_cxmng_tag_condition(statement):
             continue
         leaked = _actions(statement) & DESTRUCTIVE_ACTIONS
@@ -119,3 +126,57 @@ def test_no_wildcard_resource_on_destructive_statements(role_statements):
                 f"Destructive statement Sid={statement.get('Sid')} uses "
                 f"Resource '*' instead of an account-scoped ARN"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Ownership-tag preservation — added to defeat the repo-controlled TagPolicy
+# attack where a template declaring ``cx-mng: false`` orphans a managed policy.
+# --------------------------------------------------------------------------- #
+
+
+def _requires_request_cxmng_true(statement) -> bool:
+    cond = statement.get("Condition", {})
+    for operator in ("StringEquals", "StringEqualsIfExists"):
+        if cond.get(operator, {}).get("aws:RequestTag/cx-mng") == "true":
+            return True
+    return False
+
+
+def _denies_untag_of_cxmng(statement) -> bool:
+    if statement.get("Effect") != "Deny":
+        return False
+    if "iam:UntagPolicy" not in _actions(statement):
+        return False
+    cond = statement.get("Condition", {})
+    for operator, body in cond.items():
+        if "StringEquals" not in operator:
+            continue
+        keys = body.get("aws:TagKeys", [])
+        if isinstance(keys, str):
+            keys = [keys]
+        if "cx-mng" in keys:
+            return True
+    return False
+
+
+def test_tag_policy_requires_request_cxmng_true(role_statements):
+    """Every Allow granting iam:TagPolicy must forbid overwriting cx-mng to anything but 'true'."""
+    tag_statements = [
+        s for s in role_statements
+        if s.get("Effect") == "Allow" and "iam:TagPolicy" in _actions(s)
+    ]
+    assert tag_statements, "iam:TagPolicy permission is missing entirely"
+    for statement in tag_statements:
+        assert _requires_request_cxmng_true(statement), (
+            f"Statement Sid={statement.get('Sid')} grants iam:TagPolicy "
+            f"without aws:RequestTag/cx-mng=true; a repo-controlled TagPolicy "
+            f"call could overwrite the ownership tag."
+        )
+
+
+def test_untag_cxmng_is_explicitly_denied(role_statements):
+    """An explicit Deny must block iam:UntagPolicy whose TagKeys includes cx-mng."""
+    assert any(_denies_untag_of_cxmng(s) for s in role_statements), (
+        "No explicit Deny guards against removing the cx-mng ownership tag "
+        "via iam:UntagPolicy."
+    )

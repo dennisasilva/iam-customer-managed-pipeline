@@ -119,11 +119,39 @@ resource "aws_iam_role_policy" "deploy" {
           "iam:CreatePolicyVersion",
           "iam:DeletePolicy",
           "iam:DeletePolicyVersion",
-          "iam:TagPolicy",
           "iam:UntagPolicy",
         ]
         Resource  = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
         Condition = { StringEquals = { "aws:ResourceTag/cx-mng" = "true" } }
+      },
+      # TagPolicy exige, além da tag atual, que a request não reescreva
+      # cx-mng para algo diferente de 'true'. Assim, mesmo que o script
+      # repasse Tags vindas do repositório, o IAM bloqueia a sobrescrita
+      # da tag de propriedade antes que a policy fique órfã.
+      # StringEqualsIfExists permite TagPolicy sem incluir cx-mng.
+      {
+        Sid    = "IAMTagPolicyPreserveOwnership"
+        Effect = "Allow"
+        Action = "iam:TagPolicy"
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals         = { "aws:ResourceTag/cx-mng" = "true" }
+          StringEqualsIfExists = { "aws:RequestTag/cx-mng" = "true" }
+        }
+      },
+      # Deny explícito: nenhuma UntagPolicy desta role pode remover a tag
+      # cx-mng. Deny tem precedente sobre Allow, então o IAM bloqueia
+      # qualquer tentativa de "opt-out" via remoção da tag de propriedade.
+      {
+        Sid    = "DenyUntagOwnership"
+        Effect = "Deny"
+        Action = "iam:UntagPolicy"
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          "ForAnyValue:StringEquals" = {
+            "aws:TagKeys" = ["cx-mng"]
+          }
+        }
       },
     ]
   })

@@ -84,12 +84,38 @@ Resources:
                   - iam:CreatePolicyVersion
                   - iam:DeletePolicy
                   - iam:DeletePolicyVersion
-                  - iam:TagPolicy
                   - iam:UntagPolicy
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
                 Condition:
                   StringEquals:
                     'aws:ResourceTag/cx-mng': 'true'
+              # TagPolicy additionally requires that the request itself keep
+              # cx-mng=true: if the request tries to overwrite the ownership
+              # tag with any value other than 'true', IAM denies the call
+              # before the engine can orphan the policy. StringEqualsIfExists
+              # is used so TagPolicy calls that leave cx-mng alone (only
+              # setting repository-supplied tags) remain allowed.
+              - Sid: IAMTagPolicyPreserveOwnership
+                Effect: Allow
+                Action: iam:TagPolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/cx-mng': 'true'
+                  StringEqualsIfExists:
+                    'aws:RequestTag/cx-mng': 'true'
+              # Explicit deny: nothing this role does may ever remove the
+              # cx-mng tag. Deny takes precedence over any Allow, so an
+              # UntagPolicy request whose TagKeys includes 'cx-mng' is
+              # blocked by IAM regardless of the resource's current tags.
+              - Sid: DenyUntagOwnership
+                Effect: Deny
+                Action: iam:UntagPolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  'ForAnyValue:StringEquals':
+                    'aws:TagKeys':
+                      - 'cx-mng'
       Tags:
         - Key: cx-mng
           Value: 'true'

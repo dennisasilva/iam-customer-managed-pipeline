@@ -127,9 +127,57 @@ def policy_hash(document: dict) -> str:
     return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
 
+# Tag keys the pipeline owns. Repository-supplied values for these keys MUST
+# never be forwarded to IAM: the engine (customer-managed-deploy.py:371,
+# ~516) and the cross-account deploy role (cfn/cx-mng-stackset-deploy-role.yaml,
+# Sid IAMPolicyModifyOnlyTagged) both authorize mutating actions by inspecting
+# the ``cx-mng`` tag. A template that overwrote it would silently orphan a
+# live, privileged managed policy. See the companion TemplateValidation check
+# in source/validation/customer-managed-validation.py which fails the build
+# when a template declares one of these keys.
+RESERVED_TAG_KEY = "cx-mng"
+RESERVED_TAG_KEYS = frozenset({RESERVED_TAG_KEY})
+
+
+def is_reserved_tag_key(key) -> bool:
+    """Return True if ``key`` is reserved for pipeline ownership metadata.
+
+    Matching is case-insensitive to defeat trivial casing bypasses
+    (``Cx-Mng``, ``CX-MNG``) because IAM tag keys are themselves
+    case-sensitive but the ownership-check comparisons downstream are not
+    uniformly cased, so the only safe policy is to reject every variant.
+    """
+    if not isinstance(key, str):
+        return False
+    normalized = key.strip().lower()
+    return normalized in RESERVED_TAG_KEYS
+
+
 def filter_tags(tags: list) -> list:
-    """Drop tag entries that are missing Key or Value."""
-    return [t for t in tags if t.get("Key") and t.get("Value")]
+    """Return the sanitized tag list a repository template may apply.
+
+    Drops entries that are missing ``Key`` or ``Value`` (legacy behavior) and
+    strips any entry whose ``Key`` is reserved for pipeline ownership
+    metadata (see :data:`RESERVED_TAG_KEYS`). Stripped reserved entries are
+    logged as warnings so a template author sees the drop in build output;
+    hard rejection happens upstream in the ``TemplateValidation`` stage.
+    """
+    filtered: list = []
+    for tag in tags:
+        key = tag.get("Key")
+        value = tag.get("Value")
+        if not key or not value:
+            continue
+        if is_reserved_tag_key(key):
+            LOG.warning(
+                "Dropping repository-supplied reserved tag Key=%r (reserved "
+                "for pipeline ownership). TemplateValidation should have "
+                "rejected this earlier.",
+                key,
+            )
+            continue
+        filtered.append(tag)
+    return filtered
 
 
 def _validate_account_id(account_id, context: str) -> None:
@@ -295,11 +343,17 @@ def get_iam_client(account_id: str):
 # --------------------------------------------------------------------------- #
 
 
-def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
-    """Iterate every assignment and create or update each policy on each target account."""
+def create_update_customer_managed_policy(args: argparse.Namespace) -> int:
+    """Iterate every assignment and create or update each policy on each target account.
+
+    Returns the number of *hard* ownership/governance failures observed
+    (orphaned pipeline-managed policies, lost ``cx-mng`` tag, failed
+    post-create tagging). The caller must propagate a non-zero exit so the
+    pipeline build turns red instead of silently green.
+    """
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
-
+    hard_failures = 0
     for assignment_file in os.listdir(args.assignments_folder):
         if not assignment_file.endswith(".json"):
             continue
@@ -368,11 +422,21 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                         existing_tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
 
                         # Safety check: only touch policies tagged as managed by this pipeline.
-                        if existing_tags.get("cx-mng") != "true":
-                            LOG.info(
-                                "%s[%s] '%s' has no cx-mng:true tag. Skipping.",
-                                log_prefix, account_id, policy_name,
+                        # A policy with the pipeline's declared name that lacks the
+                        # cx-mng ownership tag is a hard build failure: it means the
+                        # policy drifted out of pipeline control (e.g. the tag was
+                        # overwritten by a prior repo-driven tag_policy call) and is
+                        # now un-updatable and un-deletable by this role. Surfacing it
+                        # red is better than silently skipping.
+                        if existing_tags.get(RESERVED_TAG_KEY) != "true":
+                            LOG.error(
+                                "%s[%s] ORPHAN: '%s' exists in the account but is "
+                                "missing the %s=true ownership tag. Pipeline cannot "
+                                "update or delete it. A target-account admin must "
+                                "restore the tag or delete the policy out of band.",
+                                log_prefix, account_id, policy_name, RESERVED_TAG_KEY,
                             )
+                            hard_failures += 1
                             continue
 
                         current_doc = get_current_policy_doc(iam, policy_arn)
@@ -395,8 +459,35 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                                 PolicyDocument=json.dumps(policy_document),
                                 SetAsDefault=True,
                             )
-                            if policy_tags:
-                                iam.tag_policy(PolicyArn=policy_arn, Tags=policy_tags)
+                            # Re-assert the reserved ownership tag on every update
+                            # alongside any repo-supplied tags. filter_tags has
+                            # already stripped reserved keys, so there is no
+                            # duplicate-key risk; the explicit cx-mng=true entry
+                            # self-heals a prior drift and makes the invariant
+                            # obvious at the call site.
+                            tags_to_apply = (
+                                [{"Key": RESERVED_TAG_KEY, "Value": "true"}]
+                                + policy_tags
+                            )
+                            iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
+
+                            # Verify the ownership tag survived the TagPolicy call.
+                            # Belt-and-braces against future refactors or an IAM
+                            # race where TagPolicy succeeded but a concurrent
+                            # UntagPolicy raced in; without this check we would
+                            # keep deploying to a policy we no longer own.
+                            verify = iam.list_policy_tags(PolicyArn=policy_arn)
+                            verify_map = {
+                                t["Key"]: t["Value"] for t in verify["Tags"]
+                            }
+                            if verify_map.get(RESERVED_TAG_KEY) != "true":
+                                LOG.error(
+                                    "[%s] '%s' lost its %s=true tag after "
+                                    "TagPolicy. Treating as hard failure.",
+                                    account_id, policy_name, RESERVED_TAG_KEY,
+                                )
+                                hard_failures += 1
+                                continue
 
                             policies_state[policy_name] = {
                                 "arn": policy_arn,
@@ -417,8 +508,32 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                                 Description=description,
                             )
                             policy_arn = response["Policy"]["Arn"]
-                            tags_to_apply = [{"Key": "cx-mng", "Value": "true"}] + policy_tags
-                            iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
+                            # filter_tags() has already stripped reserved keys
+                            # from policy_tags, so the ownership tag is applied
+                            # exactly once with no duplicate-key risk.
+                            tags_to_apply = (
+                                [{"Key": RESERVED_TAG_KEY, "Value": "true"}]
+                                + policy_tags
+                            )
+                            try:
+                                iam.tag_policy(
+                                    PolicyArn=policy_arn, Tags=tags_to_apply
+                                )
+                            except Exception as tag_exc:  # noqa: BLE001
+                                # If the ownership tag could not be applied the
+                                # policy exists in the account WITHOUT cx-mng=true
+                                # and the cross-account role can no longer touch
+                                # it. Fail the build loud so an operator sees it.
+                                LOG.error(
+                                    "[%s] CRITICAL: created '%s' but failed to "
+                                    "apply the %s=true ownership tag: %s. The "
+                                    "policy is now ungoverned; a target-account "
+                                    "admin must tag or delete it manually.",
+                                    account_id, policy_name, RESERVED_TAG_KEY,
+                                    tag_exc,
+                                )
+                                hard_failures += 1
+                                raise
 
                             policies_state[policy_name] = {
                                 "arn": policy_arn,
@@ -435,6 +550,8 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                     state["account_id"] = account_id
                     state["policies"] = policies_state
                     save_state(s3_client, account_id, state, args.state_bucket)
+
+    return hard_failures
 
 
 # --------------------------------------------------------------------------- #
@@ -462,10 +579,16 @@ def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
         return set()
 
 
-def delete_customer_managed_policy(args: argparse.Namespace) -> None:
-    """Remove pipeline-managed policies that are no longer referenced by any assignment."""
+def delete_customer_managed_policy(args: argparse.Namespace) -> int:
+    """Remove pipeline-managed policies that are no longer referenced by any assignment.
+
+    Returns the number of hard governance failures detected (e.g. a policy
+    the pipeline previously owned which has since lost its ``cx-mng=true``
+    tag). The caller must propagate a non-zero exit so the build turns red.
+    """
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    hard_failures = 0
 
     # Build {account_id: {policy_name, ...}} of policies that should remain in each account.
     policies_per_account: dict = {}
@@ -503,17 +626,59 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
         policies_state = state.get("policies", {})
 
         response = iam.list_policies(Scope="Local")
+        # Policies we previously deployed into this account (according to
+        # state) must still carry the ownership tag; if they do not, we
+        # have an orphan the pipeline role can no longer touch.
+        previously_managed_names = set(policies_state.keys())
+        seen_names: set = set()
         for policy in response["Policies"]:
             policy_name = policy["PolicyName"]
             policy_arn = policy["Arn"]
+            seen_names.add(policy_name)
 
             if policy_name in keep_for_account:
+                # Still expected to exist. If it previously belonged to this
+                # pipeline but now lacks the ownership tag, surface that as
+                # an orphan; otherwise leave it alone (handled by the
+                # create/update phase).
+                if policy_name in previously_managed_names:
+                    try:
+                        tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
+                        tag_map = {
+                            t["Key"]: t["Value"] for t in tags_response["Tags"]
+                        }
+                        if tag_map.get(RESERVED_TAG_KEY) != "true":
+                            LOG.error(
+                                "%s[%s] ORPHAN: previously managed policy '%s' "
+                                "no longer carries %s=true. Pipeline cannot "
+                                "recover without an out-of-band tag fix.",
+                                log_prefix, account_id, policy_name,
+                                RESERVED_TAG_KEY,
+                            )
+                            hard_failures += 1
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning(
+                            "[%s] Could not inspect tags on '%s': %s",
+                            account_id, policy_name, exc,
+                        )
                 continue
             try:
                 tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
                 tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
                 # Only delete policies that this pipeline created.
-                if tags.get("cx-mng") != "true":
+                if tags.get(RESERVED_TAG_KEY) != "true":
+                    # If we previously managed this policy (state has it) but
+                    # the ownership tag is gone, treat as a hard failure
+                    # instead of a silent skip.
+                    if policy_name in previously_managed_names:
+                        LOG.error(
+                            "%s[%s] ORPHAN: previously managed policy '%s' "
+                            "no longer carries %s=true. Pipeline cannot "
+                            "delete it. Manual intervention required.",
+                            log_prefix, account_id, policy_name,
+                            RESERVED_TAG_KEY,
+                        )
+                        hard_failures += 1
                     continue
 
                 LOG.info("%s[%s] DELETE '%s'", log_prefix, account_id, policy_name)
@@ -545,6 +710,8 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("[%s] Could not remove state: %s", account_id, exc)
 
+    return hard_failures
+
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
@@ -552,10 +719,24 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update first, then delete.
+
+    Returns 0 on success, 1 if either phase reported a hard governance
+    failure (orphaned pipeline-managed policy, lost ``cx-mng=true`` tag, or
+    failed post-create ownership tagging). Per-policy transient errors are
+    still logged and tolerated.
+    """
     args = parse_args()
-    create_update_customer_managed_policy(args)
-    delete_customer_managed_policy(args)
+    failures = 0
+    failures += create_update_customer_managed_policy(args)
+    failures += delete_customer_managed_policy(args)
+    if failures:
+        LOG.error(
+            "Build failed: %d policy ownership/governance failure(s) "
+            "detected. See ORPHAN log entries above.",
+            failures,
+        )
+        return 1
     return 0
 
 
