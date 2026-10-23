@@ -521,23 +521,32 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
-    """Return the set of account IDs that have a state file under ``state/`` in the bucket."""
+    """Return the set of account IDs that have a state file under ``state/`` in the bucket.
+
+    The listing is paginated so that buckets holding more than a single
+    ``list_objects_v2`` page (1000 keys) still yield every previously managed
+    account. If the paginator cannot complete (e.g. transient S3 error), the
+    caller treats it as a hard failure of the discovery step so that stale
+    policies in later-page accounts are not silently skipped.
+    """
     if not s3_client or not state_bucket:
         return set()
+    accounts: set = set()
     try:
-        response = s3_client.list_objects_v2(Bucket=state_bucket, Prefix="state/")
-        accounts: set = set()
-        for obj in response.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith(".json"):
-                continue
-            account_id = key.replace("state/", "").replace(".json", "")
-            if account_id.isdigit():
-                accounts.add(account_id)
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=state_bucket, Prefix="state/"):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".json"):
+                    continue
+                account_id = key.replace("state/", "").replace(".json", "")
+                if account_id.isdigit():
+                    accounts.add(account_id)
         return accounts
     except Exception as exc:  # noqa: BLE001
-        LOG.warning("Could not list state objects in S3: %s", exc)
-        return set()
+        # Re-raise so the build fails rather than silently losing accounts.
+        LOG.error("Could not list state objects in S3: %s", exc)
+        raise
 
 
 def delete_customer_managed_policy(args: argparse.Namespace) -> None:
@@ -580,33 +589,67 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
         state = load_state(s3_client, account_id, args.state_bucket) if s3_client else {}
         policies_state = state.get("policies", {})
 
-        response = iam.list_policies(Scope="Local")
-        for policy in response["Policies"]:
-            policy_name = policy["PolicyName"]
-            policy_arn = policy["Arn"]
+        # Enumerate every Local (customer-managed) policy in the account via the
+        # boto3 paginator. The default ``list_policies`` page size is 100 items
+        # with ``IsTruncated``/``Marker`` continuation; without pagination the
+        # revocation phase would silently stop after the first page and leave
+        # pipeline-managed policies on later pages un-reconciled.
+        visited_arns: set = set()
+        try:
+            paginator = iam.get_paginator("list_policies")
+            page_iterator = paginator.paginate(Scope="Local", OnlyAttached=False)
+            for page in page_iterator:
+                for policy in page.get("Policies", []):
+                    policy_name = policy["PolicyName"]
+                    policy_arn = policy["Arn"]
+                    visited_arns.add(policy_arn)
 
+                    if policy_name in keep_for_account:
+                        continue
+                    _revoke_pipeline_policy(
+                        iam,
+                        account_id,
+                        policy_name,
+                        policy_arn,
+                        policies_state,
+                        args,
+                        log_prefix,
+                        check_tag=True,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            # Enumeration itself failed (not a per-policy delete error). Treat
+            # this as a hard error so a truncated/erroring listing cannot
+            # masquerade as a clean revocation.
+            LOG.error(
+                "[%s] Failed to enumerate local IAM policies: %s", account_id, exc
+            )
+            raise
+
+        # Also drive deletion from the recorded state so a pipeline-created
+        # policy can be revoked by ARN even if it does not appear in the live
+        # enumeration (e.g. eventual-consistency gap, or a member-account
+        # principal padding the first page to pin a policy in place). We only
+        # touch ARNs we previously recorded as ours.
+        for policy_name in list(policies_state.keys()):
             if policy_name in keep_for_account:
                 continue
-            try:
-                tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
-                tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
-                # Only delete policies that this pipeline created.
-                if tags.get("cx-mng") != "true":
-                    continue
-
-                LOG.info("%s[%s] DELETE '%s'", log_prefix, account_id, policy_name)
-                if not args.dry_run:
-                    versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
-                    for version in versions:
-                        if not version["IsDefaultVersion"]:
-                            iam.delete_policy_version(
-                                PolicyArn=policy_arn, VersionId=version["VersionId"]
-                            )
-                    iam.delete_policy(PolicyArn=policy_arn)
-                    policies_state.pop(policy_name, None)
-                    LOG.info("[%s] '%s' deleted.", account_id, policy_name)
-            except Exception as exc:  # noqa: BLE001
-                LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
+            recorded = policies_state.get(policy_name) or {}
+            policy_arn = recorded.get("arn")
+            if not policy_arn or policy_arn in visited_arns:
+                continue
+            _revoke_pipeline_policy(
+                iam,
+                account_id,
+                policy_name,
+                policy_arn,
+                policies_state,
+                args,
+                log_prefix,
+                # The policy is one we recorded as pipeline-managed, so we do
+                # not require the ``cx-mng`` tag to be present on a listing we
+                # could not even see.
+                check_tag=False,
+            )
 
         if not args.dry_run and s3_client:
             state["account_id"] = account_id
@@ -622,6 +665,49 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                     LOG.info("[%s] State removed from S3.", account_id)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("[%s] Could not remove state: %s", account_id, exc)
+
+
+def _revoke_pipeline_policy(
+    iam,
+    account_id: str,
+    policy_name: str,
+    policy_arn: str,
+    policies_state: dict,
+    args: argparse.Namespace,
+    log_prefix: str,
+    *,
+    check_tag: bool,
+) -> None:
+    """Delete a single pipeline-managed policy, swallowing per-policy failures.
+
+    When ``check_tag`` is True (the live-enumeration path) we require the
+    ``cx-mng:true`` tag before attempting a delete so we never touch a policy
+    this pipeline did not create. When ``check_tag`` is False (the
+    recorded-state path) the policy ARN is already known to be ours, so we
+    skip the tag lookup -- useful when a padded listing hides the policy or
+    the tag API transiently fails.
+    """
+    try:
+        if check_tag:
+            tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
+            tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
+            # Only delete policies that this pipeline created.
+            if tags.get("cx-mng") != "true":
+                return
+
+        LOG.info("%s[%s] DELETE '%s'", log_prefix, account_id, policy_name)
+        if not args.dry_run:
+            versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
+            for version in versions:
+                if not version["IsDefaultVersion"]:
+                    iam.delete_policy_version(
+                        PolicyArn=policy_arn, VersionId=version["VersionId"]
+                    )
+            iam.delete_policy(PolicyArn=policy_arn)
+            policies_state.pop(policy_name, None)
+            LOG.info("[%s] '%s' deleted.", account_id, policy_name)
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
 
 
 # --------------------------------------------------------------------------- #
