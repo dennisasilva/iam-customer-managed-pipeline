@@ -119,3 +119,58 @@ def test_no_wildcard_resource_on_destructive_statements(role_statements):
                 f"Destructive statement Sid={statement.get('Sid')} uses "
                 f"Resource '*' instead of an account-scoped ARN"
             )
+
+
+# --------------------------------------------------------------------------- #
+# cx-mng is a reserved key: the role must not be able to clear or flip it.
+# These tests encode the mitigation for the attacker-writable-tag finding.
+# --------------------------------------------------------------------------- #
+
+
+def _has_request_tag_cxmng_true(statement) -> bool:
+    cond = statement.get("Condition", {})
+    string_equals = cond.get("StringEquals", {})
+    return string_equals.get("aws:RequestTag/cx-mng") == "true"
+
+
+def _has_tagkeys_denies_cxmng(statement) -> bool:
+    cond = statement.get("Condition", {})
+    forall_not = cond.get("ForAllValues:StringNotEquals", {})
+    deny_list = forall_not.get("aws:TagKeys", [])
+    if isinstance(deny_list, str):
+        deny_list = [deny_list]
+    return "cx-mng" in deny_list
+
+
+def test_tag_policy_requires_request_tag_cxmng_true(role_statements):
+    """Every iam:TagPolicy grant must pin aws:RequestTag/cx-mng to 'true'.
+
+    Without this, the role (and any Tags array supplied by the repository)
+    could write cx-mng=false on a policy and permanently remove it from
+    pipeline control.
+    """
+    tag_statements = [
+        s for s in role_statements if "iam:TagPolicy" in _actions(s)
+    ]
+    assert tag_statements, "iam:TagPolicy permission is missing entirely"
+    for statement in tag_statements:
+        assert _has_request_tag_cxmng_true(statement), (
+            f"iam:TagPolicy statement Sid={statement.get('Sid')} does not "
+            f"require aws:RequestTag/cx-mng=true"
+        )
+
+
+def test_untag_policy_forbids_cxmng_key(role_statements):
+    """Every iam:UntagPolicy grant must forbid removal of the cx-mng key.
+
+    Expressed as ForAllValues:StringNotEquals aws:TagKeys = ['cx-mng'].
+    """
+    untag_statements = [
+        s for s in role_statements if "iam:UntagPolicy" in _actions(s)
+    ]
+    assert untag_statements, "iam:UntagPolicy permission is missing entirely"
+    for statement in untag_statements:
+        assert _has_tagkeys_denies_cxmng(statement), (
+            f"iam:UntagPolicy statement Sid={statement.get('Sid')} does not "
+            f"forbid the cx-mng key via ForAllValues:StringNotEquals aws:TagKeys"
+        )

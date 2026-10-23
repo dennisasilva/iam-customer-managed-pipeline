@@ -55,6 +55,15 @@ POLICY_PATH_MAX_LENGTH = 512
 # to confusing AccessDenied errors at runtime when assume_role fails.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# Tag keys the pipeline reserves for itself (ownership markers). Policy
+# templates in the repository must not declare any of these keys in their
+# ``Tags`` array, because the deploy role's IAM conditions and the
+# reconciliation phase of the deploy script both use these keys as proof of
+# ownership. See
+# ``source/customer-managed-policies/customer-managed-deploy.py::RESERVED_TAG_KEYS``
+# for the matching defensive filter applied at the deploy sink.
+RESERVED_TAG_KEYS = frozenset({"cx-mng"})
+
 
 def parse_args() -> argparse.Namespace:
     """Parse and return the command-line arguments."""
@@ -156,6 +165,58 @@ def validate_policy_paths(policies: dict) -> None:
     LOG.info("All policy Path values are valid.")
 
 
+def validate_policy_tags(policies: dict) -> None:
+    """Raise ``ValueError`` if any policy template declares a reserved tag key.
+
+    ``cx-mng`` is the pipeline's ownership marker: it gates the deploy role's
+    destructive IAM actions (`aws:ResourceTag/cx-mng=true`) and the
+    reconciliation/delete phase of the deploy script. A template allowed to
+    declare `Tags: [{"Key": "cx-mng", ...}]` could rewrite that marker on the
+    next deploy (setting it to ``false`` permanently removes the policy from
+    pipeline control, because the IAM condition then evaluates to
+    ``AccessDenied``). The deploy sink also drops reserved keys defensively,
+    but failing fast here surfaces the problem at code-review time rather than
+    after a deploy attempt.
+
+    ``Tags`` is optional; if present it must be a list of ``{Key, Value}``
+    dicts. Entries with a non-string ``Key`` are reported as a template error.
+    """
+    errors: list = []
+    for filename, doc in policies.items():
+        tags = doc.get("Tags", [])
+        if tags is None:
+            continue
+        if not isinstance(tags, list):
+            errors.append(
+                f"{filename}: Tags must be a list, got {type(tags).__name__}"
+            )
+            continue
+        for idx, entry in enumerate(tags):
+            if not isinstance(entry, dict):
+                errors.append(
+                    f"{filename}: Tags[{idx}] must be an object, "
+                    f"got {type(entry).__name__}"
+                )
+                continue
+            key = entry.get("Key")
+            if key in RESERVED_TAG_KEYS:
+                errors.append(
+                    f"{filename}: Tags[{idx}] uses reserved key {key!r}; "
+                    f"reserved keys {sorted(RESERVED_TAG_KEYS)} are managed "
+                    f"by the pipeline and must not appear in templates."
+                )
+
+    if errors:
+        for err in errors:
+            LOG.error(err)
+        raise ValueError(
+            f"Invalid Tags field in {len(errors)} entry(ies); "
+            f"reserved keys may not be declared by policy templates."
+        )
+
+    LOG.info("All policy Tags values are valid (no reserved keys declared).")
+
+
 def load_assignment_files(folder: str) -> dict:
     """Load every ``*.json`` file in ``folder`` and return a ``{filename: dict}`` mapping.
 
@@ -253,6 +314,7 @@ def main() -> int:
 
         validate_unique_policy_name(policies)
         validate_policy_paths(policies)
+        validate_policy_tags(policies)
 
         # Validate Target account IDs only if the assignments folder was given.
         # Loud warning if missing so it does not silently skip.

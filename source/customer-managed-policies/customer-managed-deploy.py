@@ -127,9 +127,48 @@ def policy_hash(document: dict) -> str:
     return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
 
+# Tag keys the pipeline reserves for itself. Repository-supplied tags that use
+# any of these keys are silently dropped by :func:`filter_tags` and are
+# rejected by the TemplateValidation stage. See
+# ``source/validation/customer-managed-validation.py::validate_policy_tags``.
+#
+# ``cx-mng`` is the ownership marker that both the deploy role's IAM condition
+# and this script use to decide what the pipeline is allowed to mutate / delete.
+# If a repository writer were allowed to send ``cx-mng=false`` through to
+# ``iam:TagPolicy``, they could permanently remove an already-deployed policy
+# from pipeline control (the IAM condition evaluates the CURRENT tag, so the
+# first flip is accepted; after that CreatePolicyVersion/DeletePolicy/TagPolicy
+# all return AccessDenied). Treat the key as reserved on the way in.
+RESERVED_TAG_KEYS = frozenset({"cx-mng"})
+
+
 def filter_tags(tags: list) -> list:
-    """Drop tag entries that are missing Key or Value."""
-    return [t for t in tags if t.get("Key") and t.get("Value")]
+    """Return the subset of ``tags`` safe to send to ``iam:TagPolicy``.
+
+    Drops entries that:
+      * are missing ``Key`` or ``Value``; or
+      * use a key reserved for the pipeline (see :data:`RESERVED_TAG_KEYS`).
+
+    Reserved keys are dropped defensively here even though the
+    TemplateValidation stage already rejects them, so an operator running the
+    script locally against a hand-crafted template cannot bypass the invariant
+    just by skipping validation.
+    """
+    cleaned: list = []
+    for entry in tags:
+        key = entry.get("Key") if isinstance(entry, dict) else None
+        value = entry.get("Value") if isinstance(entry, dict) else None
+        if not key or not value:
+            continue
+        if key in RESERVED_TAG_KEYS:
+            LOG.warning(
+                "Dropping repository-supplied tag with reserved key %r "
+                "(reserved for pipeline ownership tracking).",
+                key,
+            )
+            continue
+        cleaned.append(entry)
+    return cleaned
 
 
 def _validate_account_id(account_id, context: str) -> None:
@@ -395,8 +434,15 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                                 PolicyDocument=json.dumps(policy_document),
                                 SetAsDefault=True,
                             )
-                            if policy_tags:
-                                iam.tag_policy(PolicyArn=policy_arn, Tags=policy_tags)
+                            # Always re-affirm the ownership tag together with
+                            # any repo-supplied tags. The IAM role's TagPolicy
+                            # grant requires aws:RequestTag/cx-mng="true" on
+                            # every call, so sending the ownership marker on
+                            # update prevents an attacker-controlled template
+                            # from flipping or dropping it (filter_tags has
+                            # already stripped any cx-mng entry from the repo).
+                            tags_to_apply = [{"Key": "cx-mng", "Value": "true"}] + policy_tags
+                            iam.tag_policy(PolicyArn=policy_arn, Tags=tags_to_apply)
 
                             policies_state[policy_name] = {
                                 "arn": policy_arn,
@@ -501,6 +547,22 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
         iam = get_iam_client(account_id)
         state = load_state(s3_client, account_id, args.state_bucket) if s3_client else {}
         policies_state = state.get("policies", {})
+        # Authoritative inventory of policies this pipeline actually created
+        # for this account, read from the S3 state file. The ``cx-mng`` tag is
+        # treated as *necessary but not sufficient* for deletion: a principal
+        # inside the member account could tag an arbitrary policy with
+        # ``cx-mng=true`` to trick the pipeline into deleting it, so we also
+        # require the policy name to appear in the state file we wrote on a
+        # previous run. If no state bucket is configured the pipeline cannot
+        # prove ownership and skips the destructive phase entirely.
+        if not args.state_bucket:
+            LOG.warning(
+                "[%s] No --state-bucket configured; skipping delete phase "
+                "(cannot prove pipeline ownership without the state file).",
+                account_id,
+            )
+            continue
+        owned_policy_names = set(policies_state.keys())
 
         response = iam.list_policies(Scope="Local")
         for policy in response["Policies"]:
@@ -508,6 +570,11 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
             policy_arn = policy["Arn"]
 
             if policy_name in keep_for_account:
+                continue
+            # Second ownership gate: the pipeline must have recorded this
+            # policy name in its own S3 state file. A member-account
+            # principal with iam:TagPolicy cannot forge that state entry.
+            if policy_name not in owned_policy_names:
                 continue
             try:
                 tags_response = iam.list_policy_tags(PolicyArn=policy_arn)

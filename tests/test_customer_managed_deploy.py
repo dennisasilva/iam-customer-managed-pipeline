@@ -57,6 +57,31 @@ def test_filter_tags_drops_entries_without_key(deploy_module):
     assert deploy_module.filter_tags(tags) == [{"Key": "Owner", "Value": "team-x"}]
 
 
+def test_filter_tags_drops_reserved_cx_mng_key_true(deploy_module):
+    """Repository-supplied ``cx-mng`` tags must be dropped (reserved key)."""
+    tags = [
+        {"Key": "cx-mng", "Value": "true"},
+        {"Key": "Owner", "Value": "team-x"},
+    ]
+    assert deploy_module.filter_tags(tags) == [{"Key": "Owner", "Value": "team-x"}]
+
+
+def test_filter_tags_drops_reserved_cx_mng_key_false(deploy_module):
+    """Attack-shape: a template cannot smuggle ``cx-mng=false`` through filter_tags."""
+    tags = [
+        {"Key": "cx-mng", "Value": "false"},
+        {"Key": "Owner", "Value": "team-x"},
+    ]
+    result = deploy_module.filter_tags(tags)
+    assert {"Key": "cx-mng", "Value": "false"} not in result
+    assert result == [{"Key": "Owner", "Value": "team-x"}]
+
+
+def test_filter_tags_reserved_keys_constant_contains_cx_mng(deploy_module):
+    """The reserved-keys set exposed by the module must include the ownership key."""
+    assert "cx-mng" in deploy_module.RESERVED_TAG_KEYS
+
+
 def test_filter_tags_handles_empty_input(deploy_module):
     assert deploy_module.filter_tags([]) == []
 
@@ -655,7 +680,7 @@ def test_create_update_dry_run_makes_no_api_mutations(
 def test_delete_removes_managed_policy_no_longer_in_assignments(
     deploy_module, aws_credentials, tmp_path
 ):
-    """A cx-mng:true policy that's not in any current assignment is deleted."""
+    """A cx-mng:true policy recorded in state but no longer assigned is deleted."""
     _create_deploy_role()
     iam = boto3.client("iam", region_name="us-east-1")
 
@@ -664,13 +689,34 @@ def test_delete_removes_managed_policy_no_longer_in_assignments(
     orphan_arn = response["Policy"]["Arn"]
     iam.tag_policy(PolicyArn=orphan_arn, Tags=[{"Key": "cx-mng", "Value": "true"}])
 
+    # The pipeline must prove it owned this policy via its own S3 state file.
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="state-bucket")
+    s3.put_object(
+        Bucket="state-bucket",
+        Key=f"state/{DEFAULT_ACCOUNT}.json",
+        Body=json.dumps({
+            "account_id": DEFAULT_ACCOUNT,
+            "policies": {
+                "OrphanPolicy": {
+                    "arn": orphan_arn,
+                    "policy_hash": deploy_module.policy_hash(DEFAULT_POLICY_DOC),
+                },
+            },
+        }),
+    )
+
     # Assignment references a different policy.
     assignments_folder = _write_assignment(
         tmp_path / "assignments",
         sid="X", target=[DEFAULT_ACCOUNT], policies=["OtherPolicy"],
     )
     policies_folder = _write_policy(tmp_path / "policies", name="OtherPolicy")
-    args = _build_args(assignments_folder=assignments_folder, policies_folder=policies_folder)
+    args = _build_args(
+        assignments_folder=assignments_folder,
+        policies_folder=policies_folder,
+        state_bucket="state-bucket",
+    )
 
     deploy_module.delete_customer_managed_policy(args)
 
@@ -678,6 +724,95 @@ def test_delete_removes_managed_policy_no_longer_in_assignments(
     policies = iam.list_policies(Scope="Local")["Policies"]
     names = [p["PolicyName"] for p in policies]
     assert "OrphanPolicy" not in names
+
+
+@mock_aws
+def test_delete_skips_when_no_state_bucket_configured(
+    deploy_module, aws_credentials, tmp_path
+):
+    """Without --state-bucket the pipeline cannot prove ownership, so delete is a no-op.
+
+    This is the hardening against the Attack 2 shape (a member-account principal
+    tags an arbitrary policy ``cx-mng=true`` to trick the pipeline into deleting
+    it): without an authoritative inventory the deploy phase refuses to act.
+    """
+    _create_deploy_role()
+    iam = boto3.client("iam", region_name="us-east-1")
+
+    response = iam.create_policy(PolicyName="Looks-Managed", PolicyDocument=json.dumps(DEFAULT_POLICY_DOC))
+    arn = response["Policy"]["Arn"]
+    iam.tag_policy(PolicyArn=arn, Tags=[{"Key": "cx-mng", "Value": "true"}])
+
+    assignments_folder = _write_assignment(
+        tmp_path / "assignments",
+        sid="X", target=[DEFAULT_ACCOUNT], policies=[],
+    )
+    policies_folder = _write_policy(tmp_path / "policies", name="Other")
+    args = _build_args(
+        assignments_folder=assignments_folder,
+        policies_folder=policies_folder,
+        state_bucket=None,  # no inventory → no deletes
+    )
+
+    deploy_module.delete_customer_managed_policy(args)
+
+    iam.get_policy(PolicyArn=arn)  # still there
+
+
+@mock_aws
+def test_delete_requires_state_file_ownership_in_addition_to_tag(
+    deploy_module, aws_credentials, tmp_path
+):
+    """Attack 2 shape: a member-account cx-mng=true tag alone cannot enroll a policy.
+
+    A policy that carries cx-mng:true but is NOT recorded in the pipeline's
+    S3 state inventory must NOT be deleted — the tag could have been written
+    by a member-account principal with only iam:TagPolicy.
+    """
+    _create_deploy_role()
+    iam = boto3.client("iam", region_name="us-east-1")
+
+    # Attacker-tagged, but never created by the pipeline.
+    response = iam.create_policy(
+        PolicyName="MemberAccountPolicy",
+        PolicyDocument=json.dumps(DEFAULT_POLICY_DOC),
+    )
+    attacker_arn = response["Policy"]["Arn"]
+    iam.tag_policy(
+        PolicyArn=attacker_arn,
+        Tags=[{"Key": "cx-mng", "Value": "true"}],  # written by a member-account principal
+    )
+
+    # State file exists but does NOT list the attacker-tagged policy.
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="state-bucket")
+    s3.put_object(
+        Bucket="state-bucket",
+        Key=f"state/{DEFAULT_ACCOUNT}.json",
+        Body=json.dumps({
+            "account_id": DEFAULT_ACCOUNT,
+            "policies": {
+                # The pipeline previously managed something else, not this one.
+                "SomeOtherPolicy": {"arn": "arn:aws:iam::123456789012:policy/SomeOtherPolicy"},
+            },
+        }),
+    )
+
+    assignments_folder = _write_assignment(
+        tmp_path / "assignments",
+        sid="X", target=[DEFAULT_ACCOUNT], policies=["OtherPolicy"],
+    )
+    policies_folder = _write_policy(tmp_path / "policies", name="OtherPolicy")
+    args = _build_args(
+        assignments_folder=assignments_folder,
+        policies_folder=policies_folder,
+        state_bucket="state-bucket",
+    )
+
+    deploy_module.delete_customer_managed_policy(args)
+
+    # Must still be there: a tag alone (no state entry) must not enroll a policy.
+    iam.get_policy(PolicyArn=attacker_arn)
 
 
 @mock_aws

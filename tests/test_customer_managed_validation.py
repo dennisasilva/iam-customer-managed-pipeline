@@ -168,6 +168,85 @@ def test_real_templates_have_valid_paths(validation_module, project_root):
 
 
 # --------------------------------------------------------------------------- #
+# validate_policy_tags — reserved-key filtering (cx-mng)
+# --------------------------------------------------------------------------- #
+
+
+def test_validate_policy_tags_accepts_missing_tags(validation_module):
+    """Templates without a Tags array pass (Tags is optional)."""
+    policies = {"p.json": {"PolicyName": "P"}}
+    validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_accepts_empty_tags(validation_module):
+    policies = {"p.json": {"PolicyName": "P", "Tags": []}}
+    validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_accepts_non_reserved_tags(validation_module):
+    policies = {
+        "p.json": {
+            "PolicyName": "P",
+            "Tags": [
+                {"Key": "Owner", "Value": "team-x"},
+                {"Key": "cost-center", "Value": "1234"},
+            ],
+        }
+    }
+    validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_rejects_reserved_cx_mng_true(validation_module):
+    """The ownership key must not be declarable from a template, even as 'true'."""
+    policies = {
+        "p.json": {
+            "PolicyName": "P",
+            "Tags": [{"Key": "cx-mng", "Value": "true"}],
+        }
+    }
+    with pytest.raises(ValueError, match="reserved"):
+        validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_rejects_reserved_cx_mng_false(validation_module):
+    """Attack 1 shape: template declaring cx-mng=false must be rejected."""
+    policies = {
+        "p.json": {
+            "PolicyName": "P",
+            "Tags": [
+                {"Key": "Owner", "Value": "team-x"},
+                {"Key": "cx-mng", "Value": "false"},
+            ],
+        }
+    }
+    with pytest.raises(ValueError, match="reserved"):
+        validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_rejects_non_list_tags(validation_module):
+    policies = {"p.json": {"PolicyName": "P", "Tags": "not-a-list"}}
+    with pytest.raises(ValueError, match="Tags must be a list"):
+        validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_rejects_non_dict_tag_entry(validation_module):
+    policies = {"p.json": {"PolicyName": "P", "Tags": ["not-a-dict"]}}
+    with pytest.raises(ValueError, match="must be an object"):
+        validation_module.validate_policy_tags(policies)
+
+
+def test_validate_policy_tags_reserved_keys_constant_contains_cx_mng(validation_module):
+    assert "cx-mng" in validation_module.RESERVED_TAG_KEYS
+
+
+def test_real_templates_have_valid_tags(validation_module, project_root):
+    """Smoke test: shipped templates must not declare reserved keys."""
+    folder = project_root / "templates" / "customer-managed-policies"
+    policies = validation_module.load_policy_files(str(folder))
+    validation_module.validate_policy_tags(policies)
+
+
+# --------------------------------------------------------------------------- #
 # load_assignment_files
 # --------------------------------------------------------------------------- #
 

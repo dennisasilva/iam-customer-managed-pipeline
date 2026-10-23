@@ -119,11 +119,39 @@ resource "aws_iam_role_policy" "deploy" {
           "iam:CreatePolicyVersion",
           "iam:DeletePolicy",
           "iam:DeletePolicyVersion",
-          "iam:TagPolicy",
-          "iam:UntagPolicy",
         ]
         Resource  = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
         Condition = { StringEquals = { "aws:ResourceTag/cx-mng" = "true" } }
+      },
+      # Tagging só pode escrever cx-mng com valor 'true'. Sem esta guarda, a
+      # role (ou um Tags vindo do repositório) poderia escrever cx-mng=false
+      # numa policy que hoje carrega 'true', removendo-a permanentemente do
+      # controle da pipeline (TagPolicy/CreatePolicyVersion/DeletePolicy
+      # passariam a retornar AccessDenied).
+      {
+        Sid    = "IAMPolicyTagOnlyOwnershipTrue"
+        Effect = "Allow"
+        Action = ["iam:TagPolicy"]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals = {
+            "aws:ResourceTag/cx-mng" = "true"
+            "aws:RequestTag/cx-mng"  = "true"
+          }
+        }
+      },
+      # Untag não pode remover a chave de propriedade cx-mng.
+      {
+        Sid    = "IAMPolicyUntagExceptOwnership"
+        Effect = "Allow"
+        Action = ["iam:UntagPolicy"]
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/cx-mng" = "true" }
+          "ForAllValues:StringNotEquals" = {
+            "aws:TagKeys" = ["cx-mng"]
+          }
+        }
       },
     ]
   })

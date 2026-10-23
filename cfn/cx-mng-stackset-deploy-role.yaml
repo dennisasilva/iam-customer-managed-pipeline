@@ -84,12 +84,46 @@ Resources:
                   - iam:CreatePolicyVersion
                   - iam:DeletePolicy
                   - iam:DeletePolicyVersion
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/cx-mng': 'true'
+              # Tagging is also gated on the ownership marker, PLUS the role
+              # may only *write* a cx-mng tag whose value is 'true'. Without
+              # this guard, the deploy role (and anyone who can influence the
+              # repo-supplied Tags) could flip cx-mng to 'false' on a policy
+              # that currently carries 'true', permanently removing it from
+              # pipeline control (future TagPolicy/CreatePolicyVersion/
+              # DeletePolicy on that resource would then be denied because
+              # the aws:ResourceTag/cx-mng=true condition no longer holds).
+              - Sid: IAMPolicyTagOnlyOwnershipTrue
+                Effect: Allow
+                Action:
                   - iam:TagPolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/cx-mng': 'true'
+                    # Every TagPolicy call MUST include cx-mng with value
+                    # 'true'. The deploy script always sends this entry on
+                    # both create and update calls; a repository-supplied
+                    # 'cx-mng=false' is dropped by filter_tags before it
+                    # reaches this sink, and even if it slipped past the
+                    # filter the condition here would deny the call.
+                    'aws:RequestTag/cx-mng': 'true'
+              # Untagging is allowed only for non-ownership keys. The deploy
+              # role must never be able to remove the cx-mng marker.
+              - Sid: IAMPolicyUntagExceptOwnership
+                Effect: Allow
+                Action:
                   - iam:UntagPolicy
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
                 Condition:
                   StringEquals:
                     'aws:ResourceTag/cx-mng': 'true'
+                  'ForAllValues:StringNotEquals':
+                    'aws:TagKeys':
+                      - 'cx-mng'
       Tags:
         - Key: cx-mng
           Value: 'true'
