@@ -19,8 +19,13 @@ and ``DryRun`` stage (no mutation) and performs three high-level operations:
    if the hash hasn't changed the policy update is skipped, which avoids burning
    IAM policy versions unnecessarily.
 
-2. **Drift detection**: While iterating, also compare the live policy document with
-   the document the pipeline last deployed. A mismatch is logged as a warning.
+2. **Drift detection and reconciliation**: While iterating, always compare the
+   live policy document with the document declared in the repository. The S3
+   state hash is used only as an optimisation hint: when the live document
+   diverges from the repository document (or the live document cannot be read),
+   the repository document is restored via ``create_policy_version(..., SetAsDefault=True)``
+   and the run is marked for an alarm so a tampered policy cannot sit behind a
+   green build.
 
 3. **Delete**: Any ``Local`` policy carrying the ``cx-mng:true`` tag that is *not*
    referenced by any current assignment is deleted. Accounts that were managed in
@@ -247,14 +252,41 @@ def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict)
 
 
 def get_current_policy_doc(iam_client, policy_arn: str):
-    """Return the document of the default version of ``policy_arn``, or None on error."""
+    """Return the document of the default version of ``policy_arn``, or None on error.
+
+    Backward-compatible wrapper around :func:`fetch_current_policy_doc` that
+    collapses any error (including ``NoSuchEntity`` and ``AccessDenied``) to
+    ``None``. Call sites that need to distinguish "missing" from "unreadable"
+    should use :func:`fetch_current_policy_doc` instead.
+    """
+    doc, _err = fetch_current_policy_doc(iam_client, policy_arn)
+    return doc
+
+
+def fetch_current_policy_doc(iam_client, policy_arn: str):
+    """Return ``(document, error)`` for the default version of ``policy_arn``.
+
+    - On success: ``(document, None)``.
+    - When IAM reports the policy does not exist: ``(None, None)``
+      (nothing to reconcile against: the create/update branch handles this).
+    - On any other failure (AccessDenied on get_policy/get_policy_version,
+      throttling, network error, malformed response): ``(None, exception)``.
+      Reconciliation must treat this as drift, because a member-account admin
+      can suppress drift detection by denying iam:GetPolicyVersion on a
+      pipeline-managed ARN.
+    """
     try:
         policy = iam_client.get_policy(PolicyArn=policy_arn)
         version_id = policy["Policy"]["DefaultVersionId"]
         version = iam_client.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)
-        return version["PolicyVersion"]["Document"]
-    except Exception:  # noqa: BLE001 - any failure means "no document available"
-        return None
+        return version["PolicyVersion"]["Document"], None
+    except Exception as exc:  # noqa: BLE001 - caller decides whether to treat as drift
+        # A genuinely missing policy is not drift: let the create/update branch
+        # recreate it. Everything else (AccessDenied, throttling, network, ...)
+        # must surface so reconciliation can treat it as drift.
+        if type(exc).__name__ == "NoSuchEntityException":
+            return None, None
+        return None, exc
 
 
 def get_iam_client(account_id: str):
@@ -295,10 +327,18 @@ def get_iam_client(account_id: str):
 # --------------------------------------------------------------------------- #
 
 
-def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
-    """Iterate every assignment and create or update each policy on each target account."""
+def create_update_customer_managed_policy(args: argparse.Namespace) -> int:
+    """Iterate every assignment and create or update each policy on each target account.
+
+    Returns the number of drift events observed (live policy document differed
+    from the repository document, or the live document could not be read). The
+    caller uses this to turn drift into a non-zero process exit so an operator
+    alarm (CloudWatch metric filter on the DRIFT log lines, or the CodeBuild
+    stage status itself) fires.
+    """
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    drift_count = 0
 
     for assignment_file in os.listdir(args.assignments_folder):
         if not assignment_file.endswith(".json"):
@@ -343,23 +383,57 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                     path = policy_data.get("Path", "/")
                     description = policy_data.get("Description", "Custom managed policy")
 
-                    # Fast path: state hash matches repo hash, so the document hasn't
-                    # changed since the last deploy. Skip the update and just check drift.
+                    # The S3 state hash is only an optimisation hint. We always
+                    # reconcile against the live policy document: a member-account
+                    # principal with iam:CreatePolicyVersion can rewrite the default
+                    # version of a pipeline-managed policy without touching the
+                    # repository, and the fast path must not let that drift stand.
+                    policy_arn = f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
                     saved = policies_state.get(policy_name, {})
                     if saved.get("policy_hash") == repo_hash:
-                        LOG.info(
-                            "%s[%s] '%s' unchanged (hash match). Skipping.",
-                            log_prefix, account_id, policy_name,
-                        )
-                        current_doc = get_current_policy_doc(
-                            iam, f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
-                        )
-                        if current_doc and policy_hash(current_doc) != repo_hash:
-                            LOG.warning(
-                                "%s[%s] DRIFT detected on '%s'!",
-                                log_prefix, account_id, policy_name,
+                        current_doc, fetch_err = fetch_current_policy_doc(iam, policy_arn)
+                        if fetch_err is not None:
+                            # Unreadable live document (e.g. member-account admin denied
+                            # iam:GetPolicyVersion to hide a tampered policy). Treat as
+                            # drift and alarm; do not silently skip.
+                            drift_count += 1
+                            LOG.error(
+                                "%s[%s] DRIFT (unreadable) on '%s' arn=%s repo_hash=%s: %s",
+                                log_prefix, account_id, policy_name, policy_arn,
+                                repo_hash, fetch_err,
                             )
-                        continue
+                            # Invalidate the cached hash so a subsequent successful
+                            # read falls through to full reconciliation on the next run.
+                            policies_state.pop(policy_name, None)
+                            continue
+                        if current_doc is None:
+                            # Policy does not exist in the account any more despite the
+                            # state file remembering it. Fall through to the normal
+                            # create/update branch below so it gets recreated.
+                            saved = {}
+                        else:
+                            live_hash = policy_hash(current_doc)
+                            if live_hash == repo_hash:
+                                LOG.info(
+                                    "%s[%s] '%s' unchanged (live hash match). Skipping.",
+                                    log_prefix, account_id, policy_name,
+                                )
+                                continue
+                            # Live document diverges from the repository document.
+                            # Log full forensics (ARN + both hashes) and reconcile by
+                            # creating a new policy version with the approved document.
+                            drift_count += 1
+                            LOG.warning(
+                                "%s[%s] DRIFT detected on '%s' arn=%s repo_hash=%s live_hash=%s - reconciling",
+                                log_prefix, account_id, policy_name, policy_arn,
+                                repo_hash, live_hash,
+                            )
+                            # Invalidate the stale hint so later state writes reflect
+                            # the version we are about to create.
+                            policies_state.pop(policy_name, None)
+                            # Fall through to the normal update branch, which will
+                            # verify the cx-mng:true tag and call create_policy_version.
+                            saved = {}
 
                     policy_arn = f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
                     try:
@@ -435,6 +509,8 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                     state["account_id"] = account_id
                     state["policies"] = policies_state
                     save_state(s3_client, account_id, state, args.state_bucket)
+
+    return drift_count
 
 
 # --------------------------------------------------------------------------- #
@@ -552,10 +628,24 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update first, then delete.
+
+    Returns 0 when the pipeline is in sync with the repository on every target
+    account. Returns 2 when drift was detected on at least one policy (live
+    document differed from the repository document or could not be read) so a
+    tampered policy cannot sit behind a green build. Per-policy ``create`` /
+    ``update`` exceptions are still logged and swallowed (the loop never
+    stops), matching the pre-existing resilience contract.
+    """
     args = parse_args()
-    create_update_customer_managed_policy(args)
+    drift_count = create_update_customer_managed_policy(args)
     delete_customer_managed_policy(args)
+    if drift_count:
+        LOG.error(
+            "Pipeline run detected drift on %d policy/policies - exiting non-zero.",
+            drift_count,
+        )
+        return 2
     return 0
 
 
