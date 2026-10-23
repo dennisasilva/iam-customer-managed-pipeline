@@ -69,7 +69,10 @@ BOTO3_CONFIG = Config(
 # AWS account IDs are exactly 12 digits. Defense-in-depth: the upstream
 # TemplateValidation stage already enforces this, but if this script is run
 # locally or that stage is skipped, we re-validate before any STS call.
-ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+# Applied with ``re.fullmatch`` so that Python's end-of-string ``$`` behaviour
+# (which also matches immediately before a trailing newline) cannot be used
+# to smuggle ``"111111111111\n"`` into the assume-role ARN or state key.
+ACCOUNT_ID_PATTERN = re.compile(r"\d{12}")
 
 
 # Default location of the JSON templates relative to this script's CWD. The
@@ -139,7 +142,7 @@ def _validate_account_id(account_id, context: str) -> None:
     file + SID), so the error message points the operator at the offending
     JSON entry instead of just the value.
     """
-    if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id)):
+    if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.fullmatch(account_id)):
         raise ValueError(
             f"Invalid Target account ID {account_id!r} in {context}. "
             f"Must be exactly 12 digits "

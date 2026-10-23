@@ -43,17 +43,30 @@ LOG = logging.getLogger(__name__)
 # IAM Path validation rules:
 #   * Must start and end with '/'.
 #   * 1-512 characters total.
-#   * Each segment between slashes contains only safe chars: A-Z a-z 0-9 . _ = + -
+#   * Each segment between slashes contains only safe chars: A-Z a-z 0-9 _ = + -
+#     and a '.' (but a segment that is only '.' or '..' is rejected below so
+#     the value cannot introduce relative-path segments into the policy ARN).
 #   * No empty segments (no '//' anywhere in the path).
 # IAM itself is more permissive (allows any printable ASCII), but a stricter
 # pattern catches typos and prevents surprising ARN composition.
-POLICY_PATH_PATTERN = re.compile(r"^/(?:[A-Za-z0-9._=+-]+/)*$")
+#
+# Patterns are applied with ``re.fullmatch`` throughout this module so that
+# Python's ``$`` end-of-string behaviour (which also matches immediately
+# before a trailing newline) cannot be used to smuggle ``"/admin/\n"`` or
+# ``"111111111111\n"`` past the documented format checks.
+POLICY_PATH_PATTERN = re.compile(r"/(?:[A-Za-z0-9._=+-]+/)*")
 POLICY_PATH_MAX_LENGTH = 512
 
+# Segments that would introduce a relative-path element into the policy ARN.
+# ``.`` and ``..`` are valid characters per the segment class above, but a
+# whole segment of either must be rejected explicitly.
+_POLICY_PATH_RELATIVE_SEGMENTS = frozenset({".", ".."})
+
 # AWS account IDs are exactly 12 digits. Anything else here (typos, trailing
-# whitespace, formatted numbers from spreadsheets, missing leading zeros) leads
-# to confusing AccessDenied errors at runtime when assume_role fails.
-ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+# whitespace or newlines, formatted numbers from spreadsheets, missing
+# leading zeros) leads to confusing AccessDenied errors at runtime when
+# assume_role fails.
+ACCOUNT_ID_PATTERN = re.compile(r"\d{12}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,10 +153,24 @@ def validate_policy_paths(policies: dict) -> None:
                 f"{filename}: Path is {len(path)} chars (max {POLICY_PATH_MAX_LENGTH})"
             )
             continue
-        if not POLICY_PATH_PATTERN.match(path):
+        if not POLICY_PATH_PATTERN.fullmatch(path):
             errors.append(
-                f"{filename}: invalid Path '{path}' "
-                f"(must start and end with '/', allowed chars: A-Z a-z 0-9 . _ = + -, no empty segments)"
+                f"{filename}: invalid Path {path!r} "
+                f"(must start and end with '/', allowed chars: A-Z a-z 0-9 . _ = + -, "
+                f"no empty segments, no whitespace, no control characters)"
+            )
+            continue
+        # Reject '.' / '..' segments outright: they are composed into the
+        # policy ARN (``arn:aws:iam::<acct>:policy<path><name>``) and must
+        # not introduce relative-path semantics there.
+        bad_segments = [
+            seg for seg in path.split("/")
+            if seg in _POLICY_PATH_RELATIVE_SEGMENTS
+        ]
+        if bad_segments:
+            errors.append(
+                f"{filename}: invalid Path {path!r} "
+                f"(relative-path segments are not allowed: {bad_segments})"
             )
 
     if errors:
@@ -219,10 +246,11 @@ def validate_target_account_ids(assignments: dict) -> None:
                         f"{filename}#{sid}: Target entry must be a string, "
                         f"got {type(account_id).__name__}: {account_id!r}"
                     )
-                elif not ACCOUNT_ID_PATTERN.match(account_id):
+                elif not ACCOUNT_ID_PATTERN.fullmatch(account_id):
                     errors.append(
                         f"{filename}#{sid}: invalid account ID {account_id!r} "
-                        f"(must be exactly 12 digits, no leading/trailing whitespace)"
+                        f"(must be exactly 12 digits, no leading/trailing "
+                        f"whitespace, newlines or control characters)"
                     )
 
     if errors:

@@ -46,8 +46,11 @@ ROLE_NAME = "deploy-customer-managed-policy"
 
 # AWS account IDs are exactly 12 digits. Defense-in-depth: this script may run
 # without the upstream TemplateValidation stage (e.g. local debugging), so we
-# re-validate before any STS call.
-ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+# re-validate before any STS call. Applied with ``re.fullmatch`` so that
+# Python's end-of-string ``$`` behaviour (which also matches immediately
+# before a trailing newline) cannot be used to smuggle ``"111111111111\n"``
+# into the assume-role ARN.
+ACCOUNT_ID_PATTERN = re.compile(r"\d{12}")
 
 # Regex for chars *not* allowed in IAM RoleSessionName (allowed: [\w+=,.@-]).
 _SESSION_NAME_INVALID_CHARS = re.compile(r"[^\w+=,.@-]")
@@ -112,7 +115,7 @@ def get_target_accounts(folder: str) -> set:
             data = json.load(file_handle)
         for assignment in data.get("Assignments", []):
             for account_id in assignment.get("Target", []):
-                if isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id):
+                if isinstance(account_id, str) and ACCOUNT_ID_PATTERN.fullmatch(account_id):
                     accounts.add(account_id)
                 else:
                     invalid.append(f"{filename}: {account_id!r}")

@@ -368,8 +368,8 @@ Puxa o código do GitHub via CodeStar Connection. Trigger automático em push na
 Roda `customer-managed-validation.py`. Valida:
 - **Sintaxe JSON** de cada arquivo em `templates/customer-managed-policies/` e `templates/assignments/`
 - **Unicidade do `PolicyName`** entre policies (sem duplicatas)
-- **Formato do `Path`** de cada policy (regex `^/(?:[A-Za-z0-9._=+-]+/)*$`, max 512 chars) — pega `//`, paths sem `/` no início/fim, chars proibidos
-- **Formato dos Account IDs** em `Target` (regex `^\d{12}$`) — pega typos do tipo trailing whitespace, formatação de planilha (vírgulas, traços), tipo errado (int em vez de string)
+- **Formato do `Path`** de cada policy (regex `\A/(?:[A-Za-z0-9._=+-]+/)*\Z` via `re.fullmatch`, max 512 chars, segmentos `.`/`..` proibidos) — pega `//`, paths sem `/` no início/fim, chars proibidos, whitespace e newline no final
+- **Formato dos Account IDs** em `Target` (regex `\A\d{12}\Z` via `re.fullmatch`) — pega typos do tipo trailing whitespace e trailing newline, formatação de planilha (vírgulas, traços), tipo errado (int em vez de string)
 
 Falha cedo, antes de qualquer call AWS, com mensagem indicando arquivo + SID + valor problemático.
 

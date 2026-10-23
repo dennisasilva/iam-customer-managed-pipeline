@@ -82,6 +82,28 @@ def test_get_target_accounts_exits_on_account_id_with_whitespace(
     assert excinfo.value.code == 1
 
 
+@pytest.mark.parametrize(
+    "bad_id",
+    ["111111111111\n", "111111111111\t", "111111111111\r", "\n111111111111"],
+)
+def test_get_target_accounts_exits_on_account_id_with_control_chars(
+    role_validation_module, tmp_path, bad_id
+):
+    """Trailing/leading newlines and control chars are rejected.
+
+    Historically ``re.match`` + a ``$`` anchor accepted one trailing ``\\n``
+    (Python's end-of-string behaviour), which would compose a malformed
+    ``arn:aws:iam::<id>\\n:role/...`` and fail opaquely in STS.
+    """
+    (tmp_path / "a.json").write_text(json.dumps({
+        "Assignments": [{"SID": "X", "Target": [bad_id]}],
+    }))
+
+    with pytest.raises(SystemExit) as excinfo:
+        role_validation_module.get_target_accounts(str(tmp_path))
+    assert excinfo.value.code == 1
+
+
 # --------------------------------------------------------------------------- #
 # check_role_exists — exercised against moto
 # --------------------------------------------------------------------------- #

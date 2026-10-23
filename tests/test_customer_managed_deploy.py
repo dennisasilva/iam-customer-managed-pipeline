@@ -211,7 +211,7 @@ def test_validate_account_id_accepts_12_digits(deploy_module):
 
 @pytest.mark.parametrize(
     "bad",
-    ["123", "99999999999", "1234567890123", "abc123456789", "111111111111 ", "", " 111111111111"],
+    ["123", "99999999999", "1234567890123", "abc123456789", "111111111111 ", "", " 111111111111", "111111111111\n", "111111111111\t", "\n111111111111"],
 )
 def test_validate_account_id_rejects_invalid(deploy_module, bad):
     """Invalid IDs raise ValueError including the offending value and context."""
