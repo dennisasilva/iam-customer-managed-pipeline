@@ -1,6 +1,16 @@
 # Copie para terraform.tfvars e ajuste os valores.
-# Gere o external_id com:  openssl rand -hex 32
-# Use o MESMO valor no módulo terraform/deploy-role (contas-alvo).
+#
+# ExternalId: NAO coloque o valor em claro aqui nem em nenhuma variavel Terraform.
+# Em vez disso, armazene o ExternalId em um secret do AWS Secrets Manager e
+# passe o ARN completo desse secret em external_id_secret_arn. Com isso o
+# valor em claro nao entra em variaveis, em Parameters, nem no state do
+# Terraform. O mesmo valor em claro precisa ser usado no modulo
+# terraform/deploy-role das contas-alvo (ver notas la).
+#
+# Passos (uma vez):
+#   1) Gere o valor (16-64 chars):  openssl rand -hex 32
+#   2) Armazene esse valor como SecretString de um secret do Secrets Manager.
+#   3) Pegue o ARN retornado e cole no campo abaixo.
 
 region            = "us-east-1"
 repository_type   = "GitHub"
@@ -10,4 +20,4 @@ branch_name       = "main"
 naming_convention = "cx-mng-pipeline"
 manual_approval   = true
 
-# external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"
+# external_id_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:cx-mng-pipeline/external-id-abcdef"

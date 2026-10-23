@@ -199,17 +199,22 @@ Configure o Git para usar `main` como branch padrão:
 git config --global init.defaultBranch main
 ```
 
-### 6. Gerar `ExternalId` para cross-account
+### 6. Gerar `ExternalId` para cross-account e armazená-lo no Secrets Manager
 
-A pipeline usa `sts:ExternalId` como shared secret em toda chamada `AssumeRole` cross-account (proteção contra confused deputy). Gere um valor forte uma única vez e use o **mesmo valor** nos 2 stacks (pipeline + StackSet):
+A pipeline usa `sts:ExternalId` como shared secret em toda chamada `AssumeRole` cross-account (proteção contra confused deputy). O valor em CLARO **não entra em nenhum parâmetro de CloudFormation nem em variável Terraform** da conta do pipeline: ele vive apenas em um secret do AWS Secrets Manager, e os projetos CodeBuild recebem só a referência (`Type: SECRETS_MANAGER`). Para o StackSet nas contas-alvo o valor em claro ainda precisa ser passado via parâmetro `NoEcho` porque a trust policy do IAM não aceita referência a secret.
 
 ```bash
-# Gerar valor seguro (alfanumérico + hífen, 64 chars)
+# 1) Gerar valor seguro (alfanumérico + hífen, 64 chars). Use o MESMO valor nos dois pontos abaixo.
 openssl rand -hex 32
 # exemplo de saída: 7b3e5f2a1c8d4e9f0a6b3c5d7e9f2a1b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f
+
+# 2) Armazenar o valor como SecretString em um secret do Secrets Manager da conta do pipeline.
+# Guarde o ARN retornado — ele vai no parâmetro ExternalIdSecretArn / external_id_secret_arn.
 ```
 
-Guarde esse valor — você vai passá-lo como parâmetro `ExternalId` em **ambos** os comandos de deploy abaixo. Para rotação no futuro, atualize a pipeline primeiro com o novo valor, depois o StackSet (a ordem inversa bloqueia a pipeline).
+Use o **mesmo valor em claro** no parâmetro `ExternalId` do StackSet (passo 4) e no parâmetro `external_id` do módulo `terraform/deploy-role` (contas-alvo). Rotação: atualize o SecretString no Secrets Manager da conta do pipeline PRIMEIRO (novos builds pegam automaticamente), depois reaplique o StackSet / `terraform/deploy-role` com o novo valor. A ordem inversa bloqueia a pipeline.
+
+> **Observação de histórico:** versões anteriores desta pipeline aceitavam `ExternalId` como parâmetro `NoEcho` do CloudFormation ou variável `sensitive` do Terraform e o escreviam como variável de ambiente `PLAINTEXT` dos três projetos CodeBuild — visível por qualquer principal com `codebuild:BatchGetProjects` / `BatchGetBuilds` ou leitura do console. Se você já implantou uma dessas versões, **considere o ExternalId divulgado** e rotacione (passos acima) após migrar para esta versão.
 
 ## Deploy da Pipeline
 
@@ -226,7 +231,7 @@ Todos os parâmetros têm validação de input (`AllowedPattern`, `MinLength`, `
 | `RepositoryOwner` | Username do owner do repositório GitHub | `dennisasilva` | regex GitHub username (max 39 chars) |
 | `BranchName` | Branch do repositório que a pipeline rastreia | `main` | regex git branch name (max 250 chars) |
 | `SecretId` | Nome do secret no Secrets Manager com o token GitHub | `dev/cx-mgn-pipe/github` | regex secret name + `NoEcho: true` |
-| `ExternalId` | Shared secret usado em todo `sts:AssumeRole` cross-account. Mesmo valor passado nos 2 stacks (pipeline + StackSet). | _(sem default — obrigatório)_ | 16-64 chars `[A-Za-z0-9_-]`, `NoEcho: true` |
+| `ExternalIdSecretArn` | ARN completo de um secret do Secrets Manager cujo `SecretString` é o ExternalId. O valor em claro **nunca** entra como parâmetro deste template; o CodeBuild resolve via `Type: SECRETS_MANAGER` a cada build. | _(sem default — obrigatório)_ | regex ARN de Secrets Manager |
 | `NamingConvention` | Prefixo para nomes dos recursos | `cx-mng-pipeline` | lowercase, max 30 chars (limita IAM RoleName a 64 chars) |
 | `ManualApproval` | Habilitar stage de aprovação manual | `true` | `AllowedValues: ['true', 'false']` |
 
@@ -245,13 +250,13 @@ aws cloudformation deploy \
     RepositoryOwner=dennisasilva \
     BranchName=main \
     SecretId=dev/cx-mgn-pipe/github \
-    ExternalId=<EXTERNAL_ID_VALUE> \
+    ExternalIdSecretArn=<ARN_DO_SECRET_NO_SECRETS_MANAGER> \
     NamingConvention=cx-mng-pipeline \
     ManualApproval=true \
   --region us-east-1
 ```
 
-> **Importante:** Use o **mesmo `ExternalId`** que você passou no StackSet do passo 4 dos pré-requisitos.
+> **Importante:** O valor em claro armazenado no secret deve ser **igual** ao `ExternalId` que você passou no StackSet do passo 4 dos pré-requisitos. Só o StackSet precisa do valor em claro (vai literalmente para a trust policy do IAM); o pipeline recebe apenas o ARN do secret.
 
 > **Importante:** Após o deploy, acesse o console do CodeStar Connections e complete a conexão com o GitHub (status deve mudar de `PENDING` para `AVAILABLE`).
 
@@ -299,12 +304,14 @@ cd terraform/deploy-role
 terraform init
 terraform apply \
   -var="pipeline_account_id=<ID_DA_CONTA_DO_PIPELINE>" \
-  -var="external_id=<MESMO_EXTERNAL_ID>"
+  -var="external_id_secret_arn=<ARN_DO_SECRET_NO_SECRETS_MANAGER>"
 ```
+
+> O módulo da pipeline recebe apenas o ARN do secret — o valor em claro não entra no state. Já o módulo abaixo (`terraform/deploy-role`, contas-alvo) ainda recebe o valor em claro via `external_id` porque a trust policy IAM não aceita referência a secret; proteja o state desse módulo adequadamente.
 
 > Assim como no CloudFormation, após o `apply` a **CodeStar Connection** nasce `PENDING` — conclua o handshake no console (Developer Tools → Connections) para `AVAILABLE` antes do primeiro run.
 
-> **Estado do Terraform:** este módulo usa backend local por padrão. Para uso em equipe, configure um backend remoto (ex.: S3 + DynamoDB lock). Lembre-se de que `external_id` é sensível e fica registrado no state — proteja o backend adequadamente.
+> **Estado do Terraform (pipeline):** este módulo usa backend local por padrão. Para uso em equipe, configure um backend remoto (ex.: S3 + DynamoDB lock). O ExternalId em claro **não** fica no state deste módulo — apenas o ARN do secret. (O módulo `terraform/deploy-role`, aplicado por conta-alvo, ainda registra o valor em claro no state porque a trust policy IAM precisa dele literalmente; proteja esse backend separadamente.)
 
 ## Estrutura do Projeto
 
@@ -735,7 +742,7 @@ aws cloudformation deploy ... && \
 - **Princípio do menor privilégio em S3**: os 3 roles de CodeBuild (`role-validation`, `template-validation`, `customer-managed-policies`) e o `code-pipeline` role têm `s3:GetObject/PutObject/ListBucket` escopados a `${CxMgrartifactsBucket}` apenas — não podem tocar em qualquer bucket da conta.
 - **KMS escopado por serviço**: `kms:Decrypt`/`kms:GenerateDataKey` nos 4 roles têm `Condition: kms:ViaService = s3.${region}.amazonaws.com`, restringindo o uso da KMS key à interação com S3 daquela região.
 - **AssumeRole cross-account específico**: o `code-pipeline` role só pode `sts:AssumeRole` em `arn:aws:iam::*:role/deploy-customer-managed-policy`, não em roles arbitrários.
-- **`sts:ExternalId` exigido em todo cross-account**: a role `deploy-customer-managed-policy` em cada conta-alvo tem `Condition: sts:ExternalId: <valor>`. Mesmo se a conta da pipeline for comprometida, um atacante que detenha apenas o ARN da role precisa também conhecer o valor do `ExternalId` (NoEcho parameter, não exposto no console). Pipeline e StackSet usam o **mesmo valor** — passado via parâmetro NoEcho em ambos os stacks. Nos scripts, lido da env var `EXTERNAL_ID` (injetada pelos CodeBuild projects via `EnvironmentVariables`).
+- **`sts:ExternalId` exigido em todo cross-account**: a role `deploy-customer-managed-policy` em cada conta-alvo tem `Condition: sts:ExternalId: <valor>`. Mesmo se a conta da pipeline for comprometida, um atacante que detenha apenas o ARN da role precisa também conhecer o valor do `ExternalId`. Na conta do pipeline o valor em claro **não** entra em parâmetro CFN nem em variável Terraform: ele vive em um secret do AWS Secrets Manager, e os projetos CodeBuild recebem apenas uma referência (`Type: SECRETS_MANAGER`), portanto `codebuild:BatchGetProjects` / `BatchGetBuilds` e o console da pipeline não retornam o valor em claro. Nos scripts, lido da env var `EXTERNAL_ID` — que o CodeBuild resolve chamando `secretsmanager:GetSecretValue` com a service role do projeto a cada build. No StackSet das contas-alvo o valor ainda é um parâmetro `NoEcho`, porque a trust policy IAM não aceita referência a secret.
 - **Ações IAM destrutivas restritas por tag**: na role cross-account `deploy-customer-managed-policy`, as ações `iam:DeletePolicy`, `iam:DeletePolicyVersion`, `iam:CreatePolicyVersion`, `iam:TagPolicy` e `iam:UntagPolicy` só são permitidas em policies que já carregam a tag `cx-mng:true` (`Condition: aws:ResourceTag/cx-mng=true`). Isso torna o **IAM** (não apenas o script de deploy) o ponto de enforcement: mesmo um script com bug ou adulterado não consegue deletar/modificar policies que a pipeline não criou. `iam:CreatePolicy` fica num statement separado sem a condition (a policy ainda não tem tag no momento de criar; o script aplica `cx-mng:true` logo em seguida).
 - **Sem dependências mortas**: nenhum dos roles tem `codecommit:GitPull` (a pipeline usa GitHub via CodeStar, não CodeCommit).
 

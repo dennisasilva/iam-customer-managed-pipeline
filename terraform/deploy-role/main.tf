@@ -70,8 +70,18 @@ resource "aws_iam_role" "deploy" {
         ]
       }
       Action = "sts:AssumeRole"
-      # ExternalId como shared secret: mesmo que a conta do pipeline seja
-      # comprometida, quem tiver só o ARN da role não a assume sem o ExternalId.
+      # ExternalId como shared secret cross-account. O valor em CLARO precisa
+      # ser literalmente embutido NESTA trust policy do IAM (nao ha como
+      # referenciar um secret aqui), por isso ele e passado como variavel
+      # 'sensitive' deste modulo. Na conta do PIPELINE, por outro lado, o
+      # mesmo valor nao e passado como variavel nem embutido em nenhum
+      # recurso: ele vive em um secret do Secrets Manager e e injetado nos
+      # projetos CodeBuild via environment_variable { type = "SECRETS_MANAGER" },
+      # de modo que codebuild:BatchGetProjects / BatchGetBuilds nao devolvem
+      # o valor em claro. Rotacao: atualize PRIMEIRO o SecretString na conta
+      # do pipeline (novos builds pegam o novo valor automaticamente), e so
+      # ENTAO reaplique este modulo com o novo external_id em cada
+      # conta-alvo. A ordem inversa bloqueia a pipeline.
       Condition = {
         StringEquals = { "sts:ExternalId" = var.external_id }
       }

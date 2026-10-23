@@ -93,7 +93,8 @@ resource "aws_codebuild_project" "role_validation" {
     }
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = "SECRETS_MANAGER"
+      value = var.external_id_secret_arn
     }
   }
 
@@ -125,7 +126,8 @@ resource "aws_codebuild_project" "dry_run" {
     }
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = "SECRETS_MANAGER"
+      value = var.external_id_secret_arn
     }
   }
 
@@ -161,7 +163,8 @@ resource "aws_codebuild_project" "customer_managed_policies" {
     }
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = "SECRETS_MANAGER"
+      value = var.external_id_secret_arn
     }
   }
 

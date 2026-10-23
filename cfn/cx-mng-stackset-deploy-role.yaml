@@ -46,11 +46,20 @@ Resources:
             Action: sts:AssumeRole
             Condition:
               StringEquals:
-                # ExternalId acts as a shared secret. Even if the pipeline
-                # account is compromised, an attacker holding only the role
-                # ARN cannot assume this role without also knowing the
-                # ExternalId value (which lives in Secrets-Manager-backed
-                # NoEcho parameters on both stacks).
+                # ExternalId acts as a shared secret. It is stored in AWS
+                # Secrets Manager in the pipeline account and injected into
+                # the CodeBuild projects as a Type: SECRETS_MANAGER
+                # environment variable, so its cleartext value is NEVER
+                # written into the CodeBuild project configuration or
+                # returned by codebuild:BatchGetProjects / BatchGetBuilds /
+                # the console. In this template it is still passed as a
+                # NoEcho CloudFormation parameter because the value has to
+                # be literally embedded in this trust policy. Rotate it by
+                # updating the Secrets Manager secret in the pipeline
+                # account FIRST (new builds pick it up on the next run),
+                # then updating this StackSet parameter with the same new
+                # value; doing it in the opposite order locks the pipeline
+                # out of every member account.
                 'sts:ExternalId': !Ref ExternalId
       Policies:
         - PolicyName: customer-managed-policy-management

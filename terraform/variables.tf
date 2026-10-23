@@ -36,14 +36,13 @@ variable "branch_name" {
   default     = "main"
 }
 
-variable "external_id" {
-  description = "Shared secret usado em todo sts:AssumeRole cross-account. Deve ser IGUAL ao ExternalId da role de deploy nas contas-alvo. Gere via 'openssl rand -hex 32'."
+variable "external_id_secret_arn" {
+  description = "ARN completo de um secret do AWS Secrets Manager cujo SecretString e o ExternalId usado em todo sts:AssumeRole cross-account. O valor DEVE ser identico ao external_id da role de deploy nas contas-alvo. Crie o secret separadamente (aws secretsmanager create-secret --name ... --secret-string <openssl rand -hex 32>) ANTES do apply. O valor em claro NUNCA entra em variavel Terraform nem no state: cada CodeBuild project recebe apenas a referencia via environment_variable { type = \"SECRETS_MANAGER\" }, e as roles de build ganham secretsmanager:GetSecretValue + kms:Decrypt apenas neste secret."
   type        = string
-  sensitive   = true
 
   validation {
-    condition     = can(regex("^[A-Za-z0-9_-]{16,64}$", var.external_id))
-    error_message = "external_id deve ter 16-64 caracteres: alfanuméricos, hífen ou underscore."
+    condition     = can(regex("^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:\\d{12}:secret:[A-Za-z0-9/_+=.@-]+$", var.external_id_secret_arn))
+    error_message = "external_id_secret_arn deve ser o ARN completo de um secret do Secrets Manager."
   }
 }
 

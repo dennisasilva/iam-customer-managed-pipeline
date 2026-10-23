@@ -86,14 +86,13 @@
       AllowedPattern: '^[A-Za-z0-9/_+=.@-]+$'
       ConstraintDescription: 'Secret name must contain only letters, numbers, and the characters / _ + = . @ -'
 
-    ExternalId:
-      Description: 'Shared secret used when assuming the cross-account deploy role. Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+    ExternalIdSecretArn:
+      Description: 'Full ARN of an AWS Secrets Manager secret whose SecretString is the shared ExternalId used when assuming the cross-account deploy role. The secret value must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Create the secret separately (aws secretsmanager create-secret --name <name> --secret-string <openssl rand -hex 32 output>) BEFORE deploying this stack. The ExternalId value is NEVER passed to this template as a parameter; CodeBuild resolves it at build time via Environment Variables of Type: SECRETS_MANAGER. The build roles receive secretsmanager:GetSecretValue + kms:Decrypt on this one secret only.'
       Type: String
-      NoEcho: true
-      MinLength: 16
-      MaxLength: 64
-      AllowedPattern: '^[A-Za-z0-9_-]+$'
-      ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
+      MinLength: 20
+      MaxLength: 2048
+      AllowedPattern: '^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+      ConstraintDescription: 'ExternalIdSecretArn must be the full ARN of a Secrets Manager secret.'
 
     NamingConvention:
       Description: 'Prefix used in IAM role/CodeBuild names. Limited to 30 chars so role names fit the IAM 64-char limit (longest suffix is "-customer-managed-policies").'
@@ -221,8 +220,13 @@
               Value: !Sub ${AWS::Region}
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
+            # ExternalId is fetched from Secrets Manager at build start; the
+            # value never appears in the project configuration, so
+            # codebuild:BatchGetProjects / BatchGetBuilds / console readers
+            # see only the secret reference, not the secret itself.
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Ref ExternalIdSecretArn
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -263,8 +267,11 @@
               Value: America/Sao_Paulo
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
+            # Resolved from Secrets Manager at build start (see
+            # CustomerManagedPoliciesCodeBuildProject for the full rationale).
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Ref ExternalIdSecretArn
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -304,8 +311,11 @@
           EnvironmentVariables:
             - Name: TZ
               Value: America/Sao_Paulo
+            # Resolved from Secrets Manager at build start (see
+            # CustomerManagedPoliciesCodeBuildProject for the full rationale).
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Ref ExternalIdSecretArn
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -384,6 +394,24 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                # ExternalId is injected into the build via a
+                # Type: SECRETS_MANAGER environment variable, which CodeBuild
+                # resolves by calling secretsmanager:GetSecretValue with THIS
+                # role as the caller. Scoped to the one secret ARN.
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref ExternalIdSecretArn
+                # Allow decrypting the secret when it is encrypted with a
+                # customer-managed KMS key. Scoped by kms:ViaService to
+                # Secrets Manager in this region; broader keys are blocked.
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +530,24 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                # ExternalId is injected into the build via a
+                # Type: SECRETS_MANAGER environment variable, which CodeBuild
+                # resolves by calling secretsmanager:GetSecretValue with THIS
+                # role as the caller. Scoped to the one secret ARN.
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref ExternalIdSecretArn
+                # Allow decrypting the secret when it is encrypted with a
+                # customer-managed KMS key. Scoped by kms:ViaService to
+                # Secrets Manager in this region; broader keys are blocked.
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##

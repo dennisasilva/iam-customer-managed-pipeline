@@ -29,6 +29,27 @@ locals {
       StringEquals = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
     }
   }
+
+  # ExternalId secret: CodeBuild resolves Type=SECRETS_MANAGER env vars by
+  # calling secretsmanager:GetSecretValue with the project's service role as
+  # the caller. Scoped to the one secret ARN; kms:Decrypt limited to KMS
+  # calls made by Secrets Manager in this region (so a customer-managed KMS
+  # key on the secret still works, but access to other keys is blocked).
+  external_id_secret_statements = [
+    {
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = var.external_id_secret_arn
+    },
+    {
+      Effect   = "Allow"
+      Action   = "kms:Decrypt"
+      Resource = "*"
+      Condition = {
+        StringEquals = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
+      }
+    },
+  ]
 }
 
 # ---------- Template Validation ----------
@@ -69,7 +90,7 @@ resource "aws_iam_role_policy" "role_validation" {
   role = aws_iam_role.role_validation.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       local.logs_statement,
       {
         Effect   = "Allow"
@@ -82,7 +103,7 @@ resource "aws_iam_role_policy" "role_validation" {
         Action   = "sts:AssumeRole"
         Resource = local.deploy_role_arn
       },
-    ]
+    ], local.external_id_secret_statements)
   })
 }
 
@@ -99,7 +120,7 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
   role = aws_iam_role.customer_managed_policies.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       local.logs_statement,
       {
         Effect   = "Allow"
@@ -112,7 +133,7 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
         Action   = "sts:AssumeRole"
         Resource = local.deploy_role_arn
       },
-    ]
+    ], local.external_id_secret_statements)
   })
 }
 
