@@ -62,6 +62,14 @@ RESERVED_TAG_KEY = "cx-mng"
 # to confusing AccessDenied errors at runtime when assume_role fails.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# IAM customer-managed policy name rules (from the AWS IAM reference):
+#   * 1-128 characters.
+#   * Allowed chars: A-Z a-z 0-9 _ + = , . @ -
+#   * Names are case-insensitive for uniqueness within an account.
+# Catching violations here avoids an opaque IAM ValidationError at deploy time.
+POLICY_NAME_PATTERN = re.compile(r"^[\w+=,.@-]+$")
+POLICY_NAME_MAX_LENGTH = 128
+
 
 def parse_args() -> argparse.Namespace:
     """Parse and return the command-line arguments."""
@@ -113,17 +121,120 @@ def load_policy_files(folder: str) -> dict:
 
 
 def validate_unique_policy_name(policies: dict) -> None:
-    """Raise ``ValueError`` if two or more policy templates share the same PolicyName."""
+    """Raise ``ValueError`` if two or more policy templates share the same PolicyName.
+
+    IAM treats customer-managed policy names as case-insensitive for uniqueness
+    within an account, so this check normalises each name with
+    ``str.strip().casefold()`` before comparing. Names that change under
+    ``strip()`` (surrounding whitespace) are rejected outright because IAM's
+    name grammar does not allow spaces, and because leaving such a name in a
+    template would hide a case/whitespace collision from this gate.
+    """
     if not policies:
         raise ValueError("No policy files were loaded; nothing to validate.")
 
-    names = [doc.get("PolicyName") for doc in policies.values() if "PolicyName" in doc]
-    duplicates = sorted({name for name in names if names.count(name) > 1})
-    if duplicates:
-        LOG.error("Customer-managed policies share the same PolicyName: %s", duplicates)
+    # Collect (filename, raw_name) for every template that declares a PolicyName.
+    raw_entries = [
+        (filename, doc.get("PolicyName"))
+        for filename, doc in policies.items()
+        if "PolicyName" in doc
+    ]
+
+    # Reject names that change under .strip() -- i.e., have surrounding
+    # whitespace. IAM rejects such names anyway, and if we silently stripped
+    # them before the duplicate check an operator-visible collision could still
+    # slip past (e.g., "MyPolicy" vs "MyPolicy " would stay distinct in the
+    # file set but collide at IAM).
+    whitespace_offenders = sorted(
+        {
+            f"{filename}: PolicyName {name!r}"
+            for filename, name in raw_entries
+            if isinstance(name, str) and name != name.strip()
+        }
+    )
+    if whitespace_offenders:
+        for offender in whitespace_offenders:
+            LOG.error("PolicyName has leading/trailing whitespace: %s", offender)
+        raise ValueError(
+            "PolicyName values must not have leading/trailing whitespace: "
+            f"{whitespace_offenders}"
+        )
+
+    # Normalise for duplicate detection: strip + casefold matches IAM's
+    # case-insensitive uniqueness rule.
+    normalised_names: list = []
+    display_by_normalised: dict = {}
+    for _filename, name in raw_entries:
+        if not isinstance(name, str):
+            # Non-string PolicyName values are caught by validate_policy_names;
+            # skip here so the duplicate check does not blow up on them.
+            continue
+        key = name.strip().casefold()
+        normalised_names.append(key)
+        display_by_normalised.setdefault(key, []).append(name)
+
+    duplicate_keys = {key for key in normalised_names if normalised_names.count(key) > 1}
+    if duplicate_keys:
+        # Report the original (as-written) names so operators can locate them.
+        duplicates = sorted(
+            {name for key in duplicate_keys for name in display_by_normalised[key]}
+        )
+        LOG.error(
+            "Customer-managed policies share the same PolicyName (case-insensitive): %s",
+            duplicates,
+        )
         raise ValueError(f"Duplicate PolicyName values: {duplicates}")
 
     LOG.info("No customer-managed policies share the same PolicyName.")
+
+
+def validate_policy_names(policies: dict) -> None:
+    """Raise ``ValueError`` if any ``PolicyName`` would be rejected by IAM.
+
+    IAM's rules for a customer-managed policy name:
+
+    * Must be a non-empty string.
+    * At most ``POLICY_NAME_MAX_LENGTH`` (128) characters.
+    * Must match ``[\\w+=,.@-]+`` (letters, digits, ``_ + = , . @ -``).
+
+    Catching violations here produces a clear, file-scoped error instead of an
+    opaque ``ValidationError`` from ``iam.create_policy`` at deploy time.
+    """
+    errors: list = []
+    for filename, doc in policies.items():
+        if "PolicyName" not in doc:
+            errors.append(f"{filename}: missing required field 'PolicyName'")
+            continue
+
+        name = doc.get("PolicyName")
+        if not isinstance(name, str):
+            errors.append(
+                f"{filename}: PolicyName must be a string, got {type(name).__name__}"
+            )
+            continue
+        if not name:
+            errors.append(f"{filename}: PolicyName must not be empty")
+            continue
+        if len(name) > POLICY_NAME_MAX_LENGTH:
+            errors.append(
+                f"{filename}: PolicyName is {len(name)} chars "
+                f"(max {POLICY_NAME_MAX_LENGTH})"
+            )
+            continue
+        if not POLICY_NAME_PATTERN.match(name):
+            errors.append(
+                f"{filename}: invalid PolicyName {name!r} "
+                f"(allowed chars: A-Z a-z 0-9 _ + = , . @ -, no whitespace)"
+            )
+
+    if errors:
+        for err in errors:
+            LOG.error(err)
+        raise ValueError(
+            f"Invalid PolicyName field in {len(errors)} policy template(s)."
+        )
+
+    LOG.info("All policy PolicyName values are valid.")
 
 
 def validate_policy_paths(policies: dict) -> None:
@@ -302,6 +413,7 @@ def main() -> int:
             LOG.error("No policies found in folder '%s'. Exiting.", args.policies_folder)
             return 1
 
+        validate_policy_names(policies)
         validate_unique_policy_name(policies)
         validate_policy_paths(policies)
         validate_policy_tags(policies)

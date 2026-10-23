@@ -412,7 +412,8 @@ Puxa o código do GitHub via CodeStar Connection. Trigger automático em push na
 ### 2. TemplateValidation
 Roda `customer-managed-validation.py`. Valida:
 - **Sintaxe JSON** de cada arquivo em `templates/customer-managed-policies/` e `templates/assignments/`
-- **Unicidade do `PolicyName`** entre policies (sem duplicatas)
+- **Unicidade do `PolicyName`** entre policies (sem duplicatas) — comparação case-insensitive via `str.strip().casefold()`, já que o IAM não diferencia maisculas/minúsculas para unicidade
+- **Formato do `PolicyName`** (regex `^[\w+=,.@-]+$`, 1-128 chars, sem espaços) — pega nomes que o IAM rejeitaria antes de qualquer call AWS
 - **Formato do `Path`** de cada policy (regex `^/(?:[A-Za-z0-9._=+-]+/)*$`, max 512 chars) — pega `//`, paths sem `/` no início/fim, chars proibidos
 - **Formato dos Account IDs** em `Target` (regex `^\d{12}$`) — pega typos do tipo trailing whitespace, formatação de planilha (vírgulas, traços), tipo errado (int em vez de string)
 

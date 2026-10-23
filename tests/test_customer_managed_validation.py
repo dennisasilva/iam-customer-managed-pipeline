@@ -90,6 +90,78 @@ def test_validate_unique_policy_name_ignores_entries_without_policy_name(validat
     validation_module.validate_unique_policy_name(policies)
 
 
+def test_validate_unique_policy_name_detects_case_only_duplicates(validation_module):
+    """IAM is case-insensitive for name uniqueness; the validator must match."""
+    policies = {
+        "p1.json": {"PolicyName": "MyPolicy"},
+        "p2.json": {"PolicyName": "mypolicy"},
+    }
+    with pytest.raises(ValueError, match="Duplicate PolicyName"):
+        validation_module.validate_unique_policy_name(policies)
+
+
+def test_validate_unique_policy_name_rejects_surrounding_whitespace(validation_module):
+    """Names that change under strip() are rejected before the duplicate check."""
+    policies = {
+        "p1.json": {"PolicyName": "MyPolicy "},  # trailing space
+    }
+    with pytest.raises(ValueError, match="leading/trailing whitespace"):
+        validation_module.validate_unique_policy_name(policies)
+
+
+def test_validate_unique_policy_name_tolerates_non_string(validation_module):
+    """Non-string PolicyName values are left to validate_policy_names to flag."""
+    policies = {
+        "p1.json": {"PolicyName": "A"},
+        "bad.json": {"PolicyName": 123},
+    }
+    # Should not raise here (caught by validate_policy_names).
+    validation_module.validate_unique_policy_name(policies)
+
+
+# --------------------------------------------------------------------------- #
+# validate_policy_names
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["MyPolicy", "a", "A1", "with_underscore", "with-dash", "with.dot", "a+b=c,d.e@f-g", "a" * 128],
+)
+def test_validate_policy_names_accepts_valid(validation_module, name):
+    policies = {"p.json": {"PolicyName": name}}
+    validation_module.validate_policy_names(policies)
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["", " ", "has space", "has/slash", "has*star", "a" * 129],
+)
+def test_validate_policy_names_rejects_invalid(validation_module, bad_name):
+    policies = {"p.json": {"PolicyName": bad_name}}
+    with pytest.raises(ValueError, match="Invalid PolicyName"):
+        validation_module.validate_policy_names(policies)
+
+
+def test_validate_policy_names_rejects_non_string(validation_module):
+    policies = {"p.json": {"PolicyName": 123}}
+    with pytest.raises(ValueError, match="Invalid PolicyName"):
+        validation_module.validate_policy_names(policies)
+
+
+def test_validate_policy_names_rejects_missing(validation_module):
+    policies = {"p.json": {"NotAPolicy": True}}
+    with pytest.raises(ValueError, match="Invalid PolicyName"):
+        validation_module.validate_policy_names(policies)
+
+
+def test_real_templates_have_valid_policy_names(validation_module, project_root):
+    """Smoke test: all actual templates have IAM-valid PolicyName values."""
+    folder = project_root / "templates" / "customer-managed-policies"
+    policies = validation_module.load_policy_files(str(folder))
+    validation_module.validate_policy_names(policies)
+
+
 # --------------------------------------------------------------------------- #
 # validate_policy_paths
 # --------------------------------------------------------------------------- #
