@@ -87,13 +87,40 @@
       ConstraintDescription: 'Secret name must contain only letters, numbers, and the characters / _ + = . @ -'
 
     ExternalId:
-      Description: 'Shared secret used when assuming the cross-account deploy role. Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+      Description: 'Shared secret used when assuming the cross-account deploy role. Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar. DEPRECATED: use ExternalIdSecretArn so the value never appears as a plaintext CodeBuild environment variable.'
       Type: String
       NoEcho: true
       MinLength: 16
       MaxLength: 64
       AllowedPattern: '^[A-Za-z0-9_-]+$'
       ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
+
+    ExternalIdSecretArn:
+      Description: 'Optional ARN of a Secrets Manager secret holding the ExternalId. When provided, the CodeBuild projects source EXTERNAL_ID from Secrets Manager (Type: SECRETS_MANAGER) and the plaintext ExternalId parameter above is NOT exposed as a CodeBuild environment variable. Leave empty to fall back to the inline ExternalId parameter (not recommended outside bootstrap).'
+      Type: String
+      Default: ''
+      AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+      ConstraintDescription: 'ExternalIdSecretArn must be empty or a valid Secrets Manager secret ARN.'
+
+    OrganizationId:
+      Description: 'AWS Organizations ID (o-xxxxxxxxxx). When set, the pipeline IAM policies restrict sts:AssumeRole to roles inside this organization (aws:ResourceOrgID condition), replacing the arn:aws:iam::*:role/... wildcard. Leave empty only when the pipeline is deployed outside an organization context.'
+      Type: String
+      Default: ''
+      AllowedPattern: '^$|^o-[a-z0-9]{10,32}$'
+      ConstraintDescription: 'OrganizationId must be empty or match o-[a-z0-9]{10,32}.'
+
+    AllowedAccountIds:
+      Description: 'Comma-separated 12-digit AWS account IDs that may be targeted by assignments. Delivered to the CodeBuild projects as the ALLOWED_ACCOUNT_IDS environment variable. The deploy / role-validation scripts refuse to assume into any account that is NOT in this list (CWE-639 defense-in-depth). Leave empty to use Organizations resolution instead (AllowedAccountIdsResolver=organizations).'
+      Type: CommaDelimitedList
+      Default: ''
+
+    AllowedAccountIdsResolver:
+      Description: 'How to resolve the account allowlist. "static" uses the AllowedAccountIds parameter above. "organizations" calls organizations:ListAccounts at runtime (requires the pipeline role to hold that permission).'
+      Type: String
+      Default: 'static'
+      AllowedValues:
+        - static
+        - organizations
 
     NamingConvention:
       Description: 'Prefix used in IAM role/CodeBuild names. Limited to 30 chars so role names fit the IAM 64-char limit (longest suffix is "-customer-managed-policies").'
@@ -120,6 +147,8 @@
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
     cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
+    cUseExternalIdSecret: !Not [ !Equals [ !Ref ExternalIdSecretArn, '' ] ]
+    cUseOrganizationCondition: !Not [ !Equals [ !Ref OrganizationId, '' ] ]
 
   Resources:
 
@@ -222,7 +251,12 @@
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: !If [cUseExternalIdSecret, SECRETS_MANAGER, PLAINTEXT]
+              Value: !If [cUseExternalIdSecret, !Ref ExternalIdSecretArn, !Ref ExternalId]
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [ ',', !Ref AllowedAccountIds ]
+            - Name: ALLOWED_ACCOUNT_IDS_RESOLVER
+              Value: !Ref AllowedAccountIdsResolver
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -264,7 +298,12 @@
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: !If [cUseExternalIdSecret, SECRETS_MANAGER, PLAINTEXT]
+              Value: !If [cUseExternalIdSecret, !Ref ExternalIdSecretArn, !Ref ExternalId]
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [ ',', !Ref AllowedAccountIds ]
+            - Name: ALLOWED_ACCOUNT_IDS_RESOLVER
+              Value: !Ref AllowedAccountIdsResolver
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -305,7 +344,12 @@
             - Name: TZ
               Value: America/Sao_Paulo
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: !If [cUseExternalIdSecret, SECRETS_MANAGER, PLAINTEXT]
+              Value: !If [cUseExternalIdSecret, !Ref ExternalIdSecretArn, !Ref ExternalId]
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [ ',', !Ref AllowedAccountIds ]
+            - Name: ALLOWED_ACCOUNT_IDS_RESOLVER
+              Value: !Ref AllowedAccountIdsResolver
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -384,6 +428,38 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # Semantic bound: when OrganizationId is set, cross-account
+                  # AssumeRole is restricted to roles inside the governed AWS
+                  # Organization (replaces the arn:aws:iam::*:role/... wildcard
+                  # with aws:ResourceOrgID). Without this Condition the
+                  # identity-side policy would allow ANY 12-digit account that
+                  # happens to host a role with the right name.
+                  Condition: !If
+                    - cUseOrganizationCondition
+                    - StringEquals:
+                        'aws:ResourceOrgID': !Ref OrganizationId
+                    - !Ref AWS::NoValue
+                # When EXTERNAL_ID is sourced from Secrets Manager, grant
+                # GetSecretValue on only that secret ARN. Omitted entirely
+                # when ExternalIdSecretArn is empty (!Ref AWS::NoValue in a
+                # Statement list is dropped by CloudFormation).
+                - !If
+                  - cUseExternalIdSecret
+                  - Effect: Allow
+                    Action:
+                      - secretsmanager:GetSecretValue
+                    Resource: !Ref ExternalIdSecretArn
+                  - !Ref AWS::NoValue
+                # When ALLOWED_ACCOUNT_IDS_RESOLVER=organizations, grant the
+                # minimum Organizations read API needed to enumerate accounts.
+                - !If
+                  - cUseOrganizationCondition
+                  - Effect: Allow
+                    Action:
+                      - organizations:ListAccounts
+                      - organizations:ListAccountsForParent
+                    Resource: '*'
+                  - !Ref AWS::NoValue
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +578,30 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # Semantic bound: when OrganizationId is set, cross-account
+                  # AssumeRole is restricted to roles inside the governed AWS
+                  # Organization (replaces the arn:aws:iam::*:role/... wildcard
+                  # with aws:ResourceOrgID).
+                  Condition: !If
+                    - cUseOrganizationCondition
+                    - StringEquals:
+                        'aws:ResourceOrgID': !Ref OrganizationId
+                    - !Ref AWS::NoValue
+                - !If
+                  - cUseExternalIdSecret
+                  - Effect: Allow
+                    Action:
+                      - secretsmanager:GetSecretValue
+                    Resource: !Ref ExternalIdSecretArn
+                  - !Ref AWS::NoValue
+                - !If
+                  - cUseOrganizationCondition
+                  - Effect: Allow
+                    Action:
+                      - organizations:ListAccounts
+                      - organizations:ListAccountsForParent
+                    Resource: '*'
+                  - !Ref AWS::NoValue
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##

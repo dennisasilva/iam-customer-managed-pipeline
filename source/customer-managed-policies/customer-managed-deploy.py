@@ -85,6 +85,38 @@ ROLE_NAME = "deploy-customer-managed-policy"
 
 
 # --------------------------------------------------------------------------- #
+# Semantic account allowlist (defence-in-depth beyond the 12-digit shape check)
+#
+# The shape check only guarantees the Target field *looks* like an account ID.
+# To bound the cross-account blast radius we also require every target account
+# to be in an operator-managed allowlist resolved at runtime from one of:
+#
+#   * ``ALLOWED_ACCOUNT_IDS`` env var — comma / whitespace separated 12-digit
+#     IDs. The value is delivered to the CodeBuild project outside the
+#     application repository (CodeBuild environment variable sourced from
+#     Secrets Manager / SSM Parameter Store, or an organization-maintained
+#     config), so a repo committer cannot widen the set by editing the repo.
+#
+#   * ``ALLOWED_ACCOUNT_IDS_RESOLVER=organizations`` — call
+#     ``organizations:ListAccounts`` at runtime and treat every ACTIVE account
+#     as allowed, optionally filtered to the OUs listed in
+#     ``ALLOWED_ORG_OU_IDS`` (comma-separated OU IDs). Requires the pipeline
+#     role to hold ``organizations:ListAccounts`` (and ``ListAccountsForParent``
+#     when scoping by OU).
+#
+# If NEITHER source is configured the script fails closed: it raises before
+# any ``sts:AssumeRole`` call, so a stray commit cannot aim IAM mutations at
+# arbitrary accounts just because they share the 12-digit shape.
+# --------------------------------------------------------------------------- #
+ALLOWED_ACCOUNT_IDS_ENV = "ALLOWED_ACCOUNT_IDS"
+ALLOWED_ACCOUNT_IDS_RESOLVER_ENV = "ALLOWED_ACCOUNT_IDS_RESOLVER"
+ALLOWED_ORG_OU_IDS_ENV = "ALLOWED_ORG_OU_IDS"
+
+# Resolved lazily on first use and cached for the rest of the process.
+_ALLOWED_ACCOUNT_IDS_CACHE = None
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 
@@ -132,18 +164,115 @@ def filter_tags(tags: list) -> list:
     return [t for t in tags if t.get("Key") and t.get("Value")]
 
 
-def _validate_account_id(account_id, context: str) -> None:
-    """Raise ``ValueError`` if ``account_id`` is not a 12-digit string.
+def _parse_account_id_list(raw: str) -> set:
+    """Parse a comma / whitespace separated allowlist string into a set of IDs.
 
-    ``context`` should describe where the value came from (e.g. assignment
-    file + SID), so the error message points the operator at the offending
-    JSON entry instead of just the value.
+    Each entry must match ``ACCOUNT_ID_PATTERN`` (12 digits). Any entry that
+    does not is rejected with ``ValueError`` so a typo in the allowlist is
+    surfaced at pipeline start rather than silently narrowing the allowlist.
+    """
+    entries = [token.strip() for token in re.split(r"[\s,]+", raw or "") if token.strip()]
+    bad = [e for e in entries if not ACCOUNT_ID_PATTERN.match(e)]
+    if bad:
+        raise ValueError(
+            f"ALLOWED_ACCOUNT_IDS contains non 12-digit entries: {bad}"
+        )
+    return set(entries)
+
+
+def _resolve_allowed_account_ids_from_organizations() -> set:
+    """Return the set of ACTIVE account IDs from AWS Organizations.
+
+    When ``ALLOWED_ORG_OU_IDS`` is set, the result is scoped to those OUs
+    (``organizations:ListAccountsForParent`` for each OU). Otherwise every
+    ACTIVE account in the org is allowed (``organizations:ListAccounts``).
+    """
+    org = boto3.client("organizations", config=BOTO3_CONFIG)
+    accounts: set = set()
+
+    ou_filter = os.environ.get(ALLOWED_ORG_OU_IDS_ENV, "").strip()
+    if ou_filter:
+        ou_ids = [token.strip() for token in re.split(r"[\s,]+", ou_filter) if token.strip()]
+        for ou_id in ou_ids:
+            paginator = org.get_paginator("list_accounts_for_parent")
+            for page in paginator.paginate(ParentId=ou_id):
+                for acct in page.get("Accounts", []):
+                    if acct.get("Status") == "ACTIVE" and acct.get("Id"):
+                        accounts.add(acct["Id"])
+    else:
+        paginator = org.get_paginator("list_accounts")
+        for page in paginator.paginate():
+            for acct in page.get("Accounts", []):
+                if acct.get("Status") == "ACTIVE" and acct.get("Id"):
+                    accounts.add(acct["Id"])
+    return accounts
+
+
+def get_allowed_account_ids() -> set:
+    """Return the operator-approved set of target account IDs (cached).
+
+    Fails closed with ``RuntimeError`` when neither configuration source is
+    present, because a missing allowlist would silently restore the previous
+    behaviour of accepting any 12-digit string as a cross-account target.
+    """
+    global _ALLOWED_ACCOUNT_IDS_CACHE
+    if _ALLOWED_ACCOUNT_IDS_CACHE is not None:
+        return _ALLOWED_ACCOUNT_IDS_CACHE
+
+    resolver = (os.environ.get(ALLOWED_ACCOUNT_IDS_RESOLVER_ENV) or "").strip().lower()
+    raw_allowlist = os.environ.get(ALLOWED_ACCOUNT_IDS_ENV, "").strip()
+
+    if resolver == "organizations":
+        allowed = _resolve_allowed_account_ids_from_organizations()
+        LOG.info(
+            "Resolved %d allowed account ID(s) from AWS Organizations.", len(allowed)
+        )
+    elif raw_allowlist:
+        allowed = _parse_account_id_list(raw_allowlist)
+        LOG.info(
+            "Resolved %d allowed account ID(s) from %s env var.",
+            len(allowed), ALLOWED_ACCOUNT_IDS_ENV,
+        )
+    else:
+        raise RuntimeError(
+            "No account allowlist configured. Set either "
+            f"{ALLOWED_ACCOUNT_IDS_ENV} (comma-separated 12-digit IDs delivered "
+            "outside the application repository) or "
+            f"{ALLOWED_ACCOUNT_IDS_RESOLVER_ENV}=organizations (and ensure the "
+            "pipeline role holds organizations:ListAccounts) before deploy. "
+            "Refusing to assume cross-account roles against an unbounded target set."
+        )
+
+    if not allowed:
+        raise RuntimeError(
+            "Resolved account allowlist is empty. Refusing to assume "
+            "cross-account roles against an unbounded target set."
+        )
+    _ALLOWED_ACCOUNT_IDS_CACHE = frozenset(allowed)
+    return _ALLOWED_ACCOUNT_IDS_CACHE
+
+
+def _validate_account_id(account_id, context: str) -> None:
+    """Raise ``ValueError`` if ``account_id`` is not an approved target.
+
+    Checks both the 12-digit shape AND membership in the operator-managed
+    allowlist resolved by :func:`get_allowed_account_ids`. ``context`` should
+    describe where the value came from (e.g. assignment file + SID), so the
+    error message points the operator at the offending JSON entry.
     """
     if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id)):
         raise ValueError(
             f"Invalid Target account ID {account_id!r} in {context}. "
             f"Must be exactly 12 digits "
             f"(did the TemplateValidation stage run before this?)."
+        )
+    allowed = get_allowed_account_ids()
+    if account_id not in allowed:
+        raise ValueError(
+            f"Target account ID {account_id!r} in {context} is not in the "
+            f"operator-managed allowlist. Add it to {ALLOWED_ACCOUNT_IDS_ENV} "
+            f"(or ensure it is part of the governed AWS Organizations scope) "
+            f"before targeting it."
         )
 
 
@@ -260,25 +389,40 @@ def get_current_policy_doc(iam_client, policy_arn: str):
 def get_iam_client(account_id: str):
     """Return an IAM client running with credentials from ``deploy-customer-managed-policy``.
 
-    Reads the ``EXTERNAL_ID`` environment variable to fulfill the
-    ``sts:ExternalId`` condition on the cross-account role's
-    AssumeRolePolicyDocument. The variable is OPTIONAL — when absent (e.g. in
-    moto-based tests or local dev with a role that has no condition), the
-    ExternalId argument is omitted, and ``assume_role`` succeeds as long as
-    the principal+action match.
-
-    In production, the StackSet enforces ``sts:ExternalId``, so a missing
-    EXTERNAL_ID env var will surface as ``AccessDenied`` from STS — caught
-    upstream by the script's per-policy error handler.
+    ``EXTERNAL_ID`` is MANDATORY: a missing or empty value raises
+    ``RuntimeError`` *before* any ``sts:AssumeRole`` call. Previously the
+    argument was silently omitted when the env var was absent, which fail-opened
+    the second factor on target accounts whose trust policy did not enforce
+    ``sts:ExternalId``. The CodeBuild projects source the value from an
+    operator-managed secret (see ``cfn/cx-mng-pipeline.yaml`` /
+    ``terraform/codebuild.tf``); local or test runs must set the env var
+    explicitly.
     """
+    # Enforce the account allowlist again at the point of use. Even when the
+    # caller already ran _validate_account_id, this guards against future call
+    # sites that forget to and keeps the "no cross-account AssumeRole without
+    # allowlist membership" invariant local to this function.
+    allowed = get_allowed_account_ids()
+    if account_id not in allowed:
+        raise ValueError(
+            f"Refusing to assume {ROLE_NAME} in account {account_id!r}: "
+            "not in the operator-managed allowlist."
+        )
+
+    external_id = os.environ.get("EXTERNAL_ID", "")
+    if not external_id:
+        raise RuntimeError(
+            "EXTERNAL_ID environment variable is missing or empty. "
+            "The sts:ExternalId second factor is mandatory for cross-account "
+            "AssumeRole; refusing to call sts:AssumeRole without it."
+        )
+
     sts = boto3.client("sts", config=BOTO3_CONFIG)
     assume_role_kwargs = {
         "RoleArn": f"arn:aws:iam::{account_id}:role/{ROLE_NAME}",
         "RoleSessionName": _build_session_name("CxMngDeploy"),
+        "ExternalId": external_id,
     }
-    external_id = os.environ.get("EXTERNAL_ID")
-    if external_id:
-        assume_role_kwargs["ExternalId"] = external_id
     assumed = sts.assume_role(**assume_role_kwargs)
     creds = assumed["Credentials"]
     return boto3.client(

@@ -29,6 +29,26 @@ locals {
       StringEquals = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
     }
   }
+
+  # When the ExternalId is sourced from Secrets Manager (SECRETS_MANAGER
+  # env-var type), the CodeBuild service role must be allowed to read that
+  # specific secret ARN. Returned as a 0- or 1-element list so callers can
+  # splat it with concat().
+  secrets_manager_statements = var.external_id_secret_arn == "" ? [] : [{
+    Effect   = "Allow"
+    Action   = ["secretsmanager:GetSecretValue"]
+    Resource = var.external_id_secret_arn
+  }]
+
+  # When the pipeline resolves the account allowlist from AWS Organizations,
+  # the CodeBuild service role must hold organizations:ListAccounts (and
+  # ListAccountsForParent when scoping by OU). Returned as a 0- or 1-element
+  # list so callers can splat it with concat().
+  organizations_list_statements = var.allowed_account_ids_resolver == "organizations" ? [{
+    Effect   = "Allow"
+    Action   = ["organizations:ListAccounts", "organizations:ListAccountsForParent"]
+    Resource = "*"
+  }] : []
 }
 
 # ---------- Template Validation ----------
@@ -69,7 +89,7 @@ resource "aws_iam_role_policy" "role_validation" {
   role = aws_iam_role.role_validation.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       local.logs_statement,
       {
         Effect   = "Allow"
@@ -77,12 +97,8 @@ resource "aws_iam_role_policy" "role_validation" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
-      {
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
-      },
-    ]
+      local.assume_role_statement,
+    ], local.secrets_manager_statements, local.organizations_list_statements)
   })
 }
 
@@ -99,7 +115,7 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
   role = aws_iam_role.customer_managed_policies.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       local.logs_statement,
       {
         Effect   = "Allow"
@@ -107,12 +123,8 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
-      {
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
-      },
-    ]
+      local.assume_role_statement,
+    ], local.secrets_manager_statements, local.organizations_list_statements)
   })
 }
 

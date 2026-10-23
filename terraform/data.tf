@@ -12,7 +12,29 @@ locals {
   artifact_bucket_name = "${local.account_id}-${local.region}-cx-mng-artfcs"
 
   # ARN da role cross-account de deploy (criada nas contas-alvo).
+  # Mantido como wildcard por conveniência IAM, mas combinado com uma Condition
+  # aws:ResourceOrgID (quando var.organization_id está preenchido) para
+  # restringir sts:AssumeRole a roles DENTRO da organização governada.
+  # Veja local.assume_role_statement abaixo.
   deploy_role_arn = "arn:aws:iam::*:role/deploy-customer-managed-policy"
+
+  # Statement reutilizável de sts:AssumeRole para as roles de CodeBuild
+  # customer_managed_policies e role_validation. Quando organization_id está
+  # vazio, cai de volta para o antigo wildcard; quando preenchido, adiciona
+  # aws:ResourceOrgID (substitui o wildcard pela organização governada —
+  # mitigação CWE-639: deploy não pode mirar contas arbitrárias no mundo).
+  assume_role_statement = merge(
+    {
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = "arn:aws:iam::*:role/deploy-customer-managed-policy"
+    },
+    var.organization_id == "" ? {} : {
+      Condition = {
+        StringEquals = { "aws:ResourceOrgID" = var.organization_id }
+      }
+    }
+  )
 
   # Seleciona a conexão CodeStar de acordo com o tipo de repositório.
   is_github      = var.repository_type == "GitHub"

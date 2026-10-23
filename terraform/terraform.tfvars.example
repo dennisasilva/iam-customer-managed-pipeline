@@ -11,3 +11,27 @@ naming_convention = "cx-mng-pipeline"
 manual_approval   = true
 
 # external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"
+
+# ---------------------------------------------------------------------------
+# Hardening recomendado contra CWE-639 (aim de mutações IAM cross-account):
+#
+# 1. Prefira armazenar o ExternalId no Secrets Manager e passar só o ARN aqui
+#    (os projetos CodeBuild recebem EXTERNAL_ID com type=SECRETS_MANAGER e o
+#    valor nunca aparece em texto puro na definição do projeto):
+# external_id_secret_arn = "arn:aws:secretsmanager:us-east-1:111111111111:secret:cx-mng/external-id-XXXXXX"
+#
+# 2. Restrinja o sts:AssumeRole da pipeline à sua organização AWS
+#    (substitui o wildcard arn:aws:iam::*:role/... pela Condition
+#    aws:ResourceOrgID):
+# organization_id = "o-xxxxxxxxxx"
+#
+# 3. Entregue o allowlist de contas-alvo fora do repositório da aplicação:
+#    um commit no templates/assignments/*.json não pode mirar uma conta que
+#    não estiver aqui.
+# allowed_account_ids          = ["111111111111", "222222222222"]
+# allowed_account_ids_resolver = "static"
+#
+#    Alternativa: resolva o allowlist em tempo de execução via Organizations
+#    (requer organizations:ListAccounts na role da pipeline):
+# allowed_account_ids_resolver = "organizations"
+# ---------------------------------------------------------------------------

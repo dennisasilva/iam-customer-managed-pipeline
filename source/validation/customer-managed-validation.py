@@ -55,6 +55,13 @@ POLICY_PATH_MAX_LENGTH = 512
 # to confusing AccessDenied errors at runtime when assume_role fails.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# Env var names for the operator-managed allowlist. See
+# source/customer-managed-policies/customer-managed-deploy.py for the full
+# rationale. The template-validation stage honours only the comma-separated
+# ``ALLOWED_ACCOUNT_IDS`` form so it stays usable without organizations
+# permissions on this short-lived build.
+ALLOWED_ACCOUNT_IDS_ENV = "ALLOWED_ACCOUNT_IDS"
+
 
 def parse_args() -> argparse.Namespace:
     """Parse and return the command-line arguments."""
@@ -188,13 +195,39 @@ def load_assignment_files(folder: str) -> dict:
 
 
 def validate_target_account_ids(assignments: dict) -> None:
-    """Raise ``ValueError`` if any ``Target`` entry is not a 12-digit account ID.
+    """Raise ``ValueError`` if any ``Target`` entry is not an approved account.
 
-    Account IDs that fall through here lead to confusing AccessDenied errors at
-    runtime (when ``sts.assume_role`` fails). Catching them at template-validation
-    time gives the operator a clear, file-scoped error message instead.
+    Each entry must (a) be a 12-digit string and (b) be present in the
+    operator-managed allowlist from ``ALLOWED_ACCOUNT_IDS`` (comma-separated),
+    when that env var is configured. If the env var is absent the shape check
+    still runs on its own — the hard allowlist enforcement happens again at
+    role-validation and deploy time, which have access to the full resolver
+    (``ALLOWED_ACCOUNT_IDS_RESOLVER=organizations``) — but a loud warning is
+    emitted so operators notice the fall-through.
     """
     errors: list = []
+
+    raw_allowlist = os.environ.get(ALLOWED_ACCOUNT_IDS_ENV, "").strip()
+    allowed_accounts: set = set()
+    if raw_allowlist:
+        tokens = [t.strip() for t in re.split(r"[\s,]+", raw_allowlist) if t.strip()]
+        bad_tokens = [t for t in tokens if not ACCOUNT_ID_PATTERN.match(t)]
+        if bad_tokens:
+            raise ValueError(
+                f"{ALLOWED_ACCOUNT_IDS_ENV} contains non 12-digit entries: {bad_tokens}"
+            )
+        allowed_accounts = set(tokens)
+        LOG.info(
+            "Allowlist loaded from %s: %d account(s).",
+            ALLOWED_ACCOUNT_IDS_ENV, len(allowed_accounts),
+        )
+    else:
+        LOG.warning(
+            "%s is not set; skipping allowlist membership check at template "
+            "validation time. Allowlist is still enforced at role-validation "
+            "and deploy time.",
+            ALLOWED_ACCOUNT_IDS_ENV,
+        )
 
     for filename, data in assignments.items():
         if not isinstance(data, dict):
@@ -223,6 +256,12 @@ def validate_target_account_ids(assignments: dict) -> None:
                     errors.append(
                         f"{filename}#{sid}: invalid account ID {account_id!r} "
                         f"(must be exactly 12 digits, no leading/trailing whitespace)"
+                    )
+                elif allowed_accounts and account_id not in allowed_accounts:
+                    errors.append(
+                        f"{filename}#{sid}: account ID {account_id!r} is not "
+                        f"in the operator-managed allowlist ({ALLOWED_ACCOUNT_IDS_ENV}). "
+                        f"Only operator-approved accounts may be targeted."
                     )
 
     if errors:

@@ -204,8 +204,9 @@ def test_assignments_and_policies_folders_can_be_overridden(deploy_module, monke
 # --------------------------------------------------------------------------- #
 
 
-def test_validate_account_id_accepts_12_digits(deploy_module):
-    """A canonical 12-digit string passes."""
+def test_validate_account_id_accepts_12_digits(deploy_module, monkeypatch):
+    """A canonical 12-digit string in the allowlist passes."""
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "111111111111")
     deploy_module._validate_account_id("111111111111", context="test")
 
 
@@ -225,12 +226,58 @@ def test_validate_account_id_rejects_non_string(deploy_module):
         deploy_module._validate_account_id(111111111111, context="test")
 
 
-def test_validate_account_id_includes_context_in_error(deploy_module):
+def test_validate_account_id_includes_context_in_error(deploy_module, monkeypatch):
     """The error message contains the supplied context for traceability."""
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "111111111111")
     with pytest.raises(ValueError, match="some-file.json#MyAssignment"):
         deploy_module._validate_account_id(
             "bad", context="some-file.json#MyAssignment"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Semantic account allowlist (CWE-639 defense-in-depth)
+# --------------------------------------------------------------------------- #
+
+
+def test_validate_account_id_rejects_shape_valid_but_not_in_allowlist(
+    deploy_module, monkeypatch
+):
+    """A 12-digit ID that is NOT in ALLOWED_ACCOUNT_IDS is refused."""
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "111111111111,222222222222")
+    # Shape-valid but not in the allowlist.
+    with pytest.raises(ValueError, match="not in the operator-managed allowlist"):
+        deploy_module._validate_account_id("999999999999", context="test")
+
+
+def test_validate_account_id_fails_closed_without_allowlist(
+    deploy_module, monkeypatch
+):
+    """When neither ALLOWED_ACCOUNT_IDS nor the resolver is set, we fail closed."""
+    monkeypatch.delenv("ALLOWED_ACCOUNT_IDS", raising=False)
+    monkeypatch.delenv("ALLOWED_ACCOUNT_IDS_RESOLVER", raising=False)
+    with pytest.raises(RuntimeError, match="No account allowlist configured"):
+        deploy_module._validate_account_id("111111111111", context="test")
+
+
+def test_get_allowed_account_ids_parses_whitespace_and_commas(
+    deploy_module, monkeypatch
+):
+    """Allowlist tokens may be separated by any mix of commas or whitespace."""
+    monkeypatch.setenv(
+        "ALLOWED_ACCOUNT_IDS",
+        "111111111111, 222222222222\t 333333333333",
+    )
+    assert deploy_module.get_allowed_account_ids() == frozenset(
+        {"111111111111", "222222222222", "333333333333"}
+    )
+
+
+def test_get_allowed_account_ids_rejects_malformed_entry(deploy_module, monkeypatch):
+    """An entry that does not match the 12-digit shape fails fast at resolution."""
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "111111111111,not-a-number")
+    with pytest.raises(ValueError, match="non 12-digit entries"):
+        deploy_module.get_allowed_account_ids()
 
 
 # --------------------------------------------------------------------------- #
@@ -833,6 +880,7 @@ def test_get_iam_client_passes_external_id_when_env_var_set(
 ):
     """When EXTERNAL_ID env var is set, assume_role is called WITH ExternalId."""
     monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
@@ -846,37 +894,56 @@ def test_get_iam_client_passes_external_id_when_env_var_set(
     assert call_kwargs["RoleArn"] == "arn:aws:iam::123456789012:role/deploy-customer-managed-policy"
 
 
-def test_get_iam_client_omits_external_id_when_env_var_unset(
+def test_get_iam_client_raises_when_external_id_env_var_unset(
     deploy_module, monkeypatch
 ):
-    """When EXTERNAL_ID is absent, ExternalId is NOT passed (backward compat)."""
+    """EXTERNAL_ID is mandatory — missing env var raises BEFORE any assume_role."""
     monkeypatch.delenv("EXTERNAL_ID", raising=False)
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
 
     with _patch_boto3_clients(deploy_module, sts_mock, iam_mock):
-        deploy_module.get_iam_client("123456789012")
+        with pytest.raises(RuntimeError, match="EXTERNAL_ID"):
+            deploy_module.get_iam_client("123456789012")
 
-    sts_mock.assume_role.assert_called_once()
-    call_kwargs = sts_mock.assume_role.call_args.kwargs
-    assert "ExternalId" not in call_kwargs
+    sts_mock.assume_role.assert_not_called()
 
 
-def test_get_iam_client_omits_external_id_when_env_var_empty_string(
+def test_get_iam_client_raises_when_external_id_env_var_empty_string(
     deploy_module, monkeypatch
 ):
-    """An empty EXTERNAL_ID is treated as unset — avoids passing '' to AWS."""
+    """An empty EXTERNAL_ID is treated as unset — raise, do not AssumeRole."""
     monkeypatch.setenv("EXTERNAL_ID", "")
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
 
     with _patch_boto3_clients(deploy_module, sts_mock, iam_mock):
-        deploy_module.get_iam_client("123456789012")
+        with pytest.raises(RuntimeError, match="EXTERNAL_ID"):
+            deploy_module.get_iam_client("123456789012")
 
-    call_kwargs = sts_mock.assume_role.call_args.kwargs
-    assert "ExternalId" not in call_kwargs
+    sts_mock.assume_role.assert_not_called()
+
+
+def test_get_iam_client_refuses_account_not_in_allowlist(
+    deploy_module, monkeypatch
+):
+    """get_iam_client refuses to AssumeRole into any account not in the allowlist."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
+
+    sts_mock = _make_sts_mock_returning_creds()
+    iam_mock = MagicMock()
+
+    with _patch_boto3_clients(deploy_module, sts_mock, iam_mock):
+        with pytest.raises(ValueError, match="not in the operator-managed allowlist"):
+            # Shape-valid but not in the allowlist (attacker-controlled account).
+            deploy_module.get_iam_client("999999999999")
+
+    sts_mock.assume_role.assert_not_called()
 
 
 # --- end ExternalId behavior --- #

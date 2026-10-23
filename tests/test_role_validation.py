@@ -189,6 +189,7 @@ def test_check_role_exists_passes_external_id_when_env_var_set(
 ):
     """When EXTERNAL_ID is set, check_role_exists threads it into assume_role."""
     monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
@@ -202,18 +203,36 @@ def test_check_role_exists_passes_external_id_when_env_var_set(
     assert call_kwargs.get("ExternalId") == "test-external-id-1234567890"
 
 
-def test_check_role_exists_omits_external_id_when_env_var_unset(
+def test_check_role_exists_raises_when_external_id_env_var_unset(
     role_validation_module, monkeypatch
 ):
-    """When EXTERNAL_ID is absent, ExternalId is NOT passed (backward compat)."""
+    """EXTERNAL_ID is mandatory — missing env var raises BEFORE any assume_role."""
     monkeypatch.delenv("EXTERNAL_ID", raising=False)
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
-    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.ROLE_NAME}}
 
     with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
-        role_validation_module.check_role_exists("123456789012")
+        with pytest.raises(RuntimeError, match="EXTERNAL_ID"):
+            role_validation_module.check_role_exists("123456789012")
 
-    call_kwargs = sts_mock.assume_role.call_args.kwargs
-    assert "ExternalId" not in call_kwargs
+    sts_mock.assume_role.assert_not_called()
+
+
+def test_check_role_exists_refuses_account_not_in_allowlist(
+    role_validation_module, monkeypatch
+):
+    """check_role_exists refuses to AssumeRole into non-allowlisted accounts."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "123456789012")
+
+    sts_mock = _make_sts_mock_returning_creds()
+    iam_mock = MagicMock()
+
+    with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
+        # Shape-valid but not in the allowlist — must fail BEFORE AssumeRole,
+        # so the attacker's trust policy cannot harvest the ExternalId.
+        assert role_validation_module.check_role_exists("999999999999") is False
+
+    sts_mock.assume_role.assert_not_called()

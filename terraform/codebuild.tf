@@ -93,7 +93,16 @@ resource "aws_codebuild_project" "role_validation" {
     }
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = var.external_id_secret_arn == "" ? "PLAINTEXT" : "SECRETS_MANAGER"
+      value = var.external_id_secret_arn == "" ? var.external_id : var.external_id_secret_arn
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS_RESOLVER"
+      value = var.allowed_account_ids_resolver
     }
   }
 
@@ -125,7 +134,16 @@ resource "aws_codebuild_project" "dry_run" {
     }
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = var.external_id_secret_arn == "" ? "PLAINTEXT" : "SECRETS_MANAGER"
+      value = var.external_id_secret_arn == "" ? var.external_id : var.external_id_secret_arn
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS_RESOLVER"
+      value = var.allowed_account_ids_resolver
     }
   }
 
@@ -161,7 +179,16 @@ resource "aws_codebuild_project" "customer_managed_policies" {
     }
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = var.external_id_secret_arn == "" ? "PLAINTEXT" : "SECRETS_MANAGER"
+      value = var.external_id_secret_arn == "" ? var.external_id : var.external_id_secret_arn
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS_RESOLVER"
+      value = var.allowed_account_ids_resolver
     }
   }
 

@@ -49,6 +49,16 @@ ROLE_NAME = "deploy-customer-managed-policy"
 # re-validate before any STS call.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# Env-var-driven allowlist (see customer-managed-deploy.py for the full
+# rationale). RoleValidation refuses to assume into any account that is not
+# in the operator-managed allowlist, so a repo-controlled Target cannot aim
+# a cross-account AssumeRole at an arbitrary account.
+ALLOWED_ACCOUNT_IDS_ENV = "ALLOWED_ACCOUNT_IDS"
+ALLOWED_ACCOUNT_IDS_RESOLVER_ENV = "ALLOWED_ACCOUNT_IDS_RESOLVER"
+ALLOWED_ORG_OU_IDS_ENV = "ALLOWED_ORG_OU_IDS"
+
+_ALLOWED_ACCOUNT_IDS_CACHE = None
+
 # Regex for chars *not* allowed in IAM RoleSessionName (allowed: [\w+=,.@-]).
 _SESSION_NAME_INVALID_CHARS = re.compile(r"[^\w+=,.@-]")
 
@@ -76,6 +86,83 @@ BOTO3_CONFIG = Config(
     read_timeout=30,
     retries={"max_attempts": 2, "mode": "adaptive"},
 )
+
+
+def _parse_account_id_list(raw: str) -> set:
+    """Parse a comma/whitespace separated allowlist into a set of 12-digit IDs."""
+    entries = [token.strip() for token in re.split(r"[\s,]+", raw or "") if token.strip()]
+    bad = [e for e in entries if not ACCOUNT_ID_PATTERN.match(e)]
+    if bad:
+        raise ValueError(
+            f"ALLOWED_ACCOUNT_IDS contains non 12-digit entries: {bad}"
+        )
+    return set(entries)
+
+
+def _resolve_allowed_account_ids_from_organizations() -> set:
+    """Return ACTIVE account IDs from Organizations, optionally scoped by OU."""
+    org = boto3.client("organizations", config=BOTO3_CONFIG)
+    accounts: set = set()
+    ou_filter = os.environ.get(ALLOWED_ORG_OU_IDS_ENV, "").strip()
+    if ou_filter:
+        ou_ids = [token.strip() for token in re.split(r"[\s,]+", ou_filter) if token.strip()]
+        for ou_id in ou_ids:
+            paginator = org.get_paginator("list_accounts_for_parent")
+            for page in paginator.paginate(ParentId=ou_id):
+                for acct in page.get("Accounts", []):
+                    if acct.get("Status") == "ACTIVE" and acct.get("Id"):
+                        accounts.add(acct["Id"])
+    else:
+        paginator = org.get_paginator("list_accounts")
+        for page in paginator.paginate():
+            for acct in page.get("Accounts", []):
+                if acct.get("Status") == "ACTIVE" and acct.get("Id"):
+                    accounts.add(acct["Id"])
+    return accounts
+
+
+def get_allowed_account_ids() -> set:
+    """Return the operator-approved set of target account IDs (cached).
+
+    Fails closed when neither ``ALLOWED_ACCOUNT_IDS`` nor
+    ``ALLOWED_ACCOUNT_IDS_RESOLVER=organizations`` is configured, so a
+    repository commit cannot aim the pipeline at arbitrary accounts just
+    because they match the 12-digit shape.
+    """
+    global _ALLOWED_ACCOUNT_IDS_CACHE
+    if _ALLOWED_ACCOUNT_IDS_CACHE is not None:
+        return _ALLOWED_ACCOUNT_IDS_CACHE
+
+    resolver = (os.environ.get(ALLOWED_ACCOUNT_IDS_RESOLVER_ENV) or "").strip().lower()
+    raw_allowlist = os.environ.get(ALLOWED_ACCOUNT_IDS_ENV, "").strip()
+
+    if resolver == "organizations":
+        allowed = _resolve_allowed_account_ids_from_organizations()
+        LOG.info(
+            "Resolved %d allowed account ID(s) from AWS Organizations.", len(allowed)
+        )
+    elif raw_allowlist:
+        allowed = _parse_account_id_list(raw_allowlist)
+        LOG.info(
+            "Resolved %d allowed account ID(s) from %s env var.",
+            len(allowed), ALLOWED_ACCOUNT_IDS_ENV,
+        )
+    else:
+        raise RuntimeError(
+            "No account allowlist configured. Set either "
+            f"{ALLOWED_ACCOUNT_IDS_ENV} or "
+            f"{ALLOWED_ACCOUNT_IDS_RESOLVER_ENV}=organizations before running "
+            "role validation. Refusing to assume cross-account roles against "
+            "an unbounded target set."
+        )
+
+    if not allowed:
+        raise RuntimeError(
+            "Resolved account allowlist is empty. Refusing to run role "
+            "validation against an unbounded target set."
+        )
+    _ALLOWED_ACCOUNT_IDS_CACHE = frozenset(allowed)
+    return _ALLOWED_ACCOUNT_IDS_CACHE
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,20 +219,38 @@ def get_target_accounts(folder: str) -> set:
 def check_role_exists(account_id: str) -> bool:
     """Return True if ``ROLE_NAME`` is assumable from this caller in ``account_id``.
 
-    Reads the ``EXTERNAL_ID`` environment variable to satisfy the
-    ``sts:ExternalId`` condition on the cross-account role's
-    AssumeRolePolicyDocument. When absent, the argument is omitted (allows
-    moto-based tests and local dev against roles without the condition).
+    ``EXTERNAL_ID`` is MANDATORY: a missing or empty value raises
+    ``RuntimeError`` before any ``sts:AssumeRole`` call. The CodeBuild
+    project sources the value from an operator-managed secret; local or test
+    runs must set the env var explicitly.
     """
+    # Allowlist membership is also required here, so an account that passes
+    # the shape check but is not operator-approved never triggers an
+    # AssumeRole attempt (which would otherwise probe the attacker-controlled
+    # trust policy and surface the ExternalId in their CloudTrail).
+    allowed = get_allowed_account_ids()
+    if account_id not in allowed:
+        LOG.error(
+            "[%s] Not in operator-managed account allowlist; refusing to "
+            "assume %s.", account_id, ROLE_NAME,
+        )
+        return False
+
+    external_id = os.environ.get("EXTERNAL_ID", "")
+    if not external_id:
+        raise RuntimeError(
+            "EXTERNAL_ID environment variable is missing or empty. "
+            "The sts:ExternalId second factor is mandatory for cross-account "
+            "AssumeRole; refusing to call sts:AssumeRole without it."
+        )
+
     sts = boto3.client("sts", config=BOTO3_CONFIG)
     try:
         assume_role_kwargs = {
             "RoleArn": f"arn:aws:iam::{account_id}:role/{ROLE_NAME}",
             "RoleSessionName": _build_session_name("CxMngValidate"),
+            "ExternalId": external_id,
         }
-        external_id = os.environ.get("EXTERNAL_ID")
-        if external_id:
-            assume_role_kwargs["ExternalId"] = external_id
         assumed = sts.assume_role(**assume_role_kwargs)
         creds = assumed["Credentials"]
         iam = boto3.client(

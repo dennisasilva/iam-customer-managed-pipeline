@@ -319,6 +319,40 @@ def test_real_assignments_have_valid_target_ids(validation_module, project_root)
     validation_module.validate_target_account_ids(assignments)
 
 
+def test_validate_target_account_ids_enforces_allowlist_when_env_var_set(
+    validation_module, monkeypatch, caplog
+):
+    """Shape-valid Target IDs that are not in ALLOWED_ACCOUNT_IDS are rejected."""
+    import logging
+    caplog.set_level(logging.ERROR)
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "111111111111,222222222222")
+
+    assignments = {
+        "a.json": {
+            "Assignments": [
+                {"SID": "Good", "Target": ["111111111111"]},
+                # Shape-valid, but not in the operator-managed allowlist.
+                {"SID": "Bad", "Target": ["999999999999"]},
+            ],
+        },
+    }
+    with pytest.raises(ValueError, match="Invalid Target account ID"):
+        validation_module.validate_target_account_ids(assignments)
+    assert "not in the operator-managed allowlist" in caplog.text
+
+
+def test_validate_target_account_ids_rejects_malformed_allowlist(
+    validation_module, monkeypatch
+):
+    """A malformed ALLOWED_ACCOUNT_IDS value fails fast at validation time."""
+    monkeypatch.setenv("ALLOWED_ACCOUNT_IDS", "111111111111,not-a-number")
+    assignments = {
+        "a.json": {"Assignments": [{"SID": "X", "Target": ["111111111111"]}]},
+    }
+    with pytest.raises(ValueError, match="non 12-digit entries"):
+        validation_module.validate_target_account_ids(assignments)
+
+
 # --------------------------------------------------------------------------- #
 # Smoke test against the real templates folder
 # --------------------------------------------------------------------------- #
