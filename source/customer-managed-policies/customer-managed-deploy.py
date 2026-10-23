@@ -525,15 +525,18 @@ def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
     if not s3_client or not state_bucket:
         return set()
     try:
-        response = s3_client.list_objects_v2(Bucket=state_bucket, Prefix="state/")
         accounts: set = set()
-        for obj in response.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith(".json"):
-                continue
-            account_id = key.replace("state/", "").replace(".json", "")
-            if account_id.isdigit():
-                accounts.add(account_id)
+        # Use a paginator so accounts whose state keys fall beyond the first
+        # 1000-key page are still swept (ListObjectsV2 caps at 1000/page).
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=state_bucket, Prefix="state/"):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".json"):
+                    continue
+                account_id = key.replace("state/", "").replace(".json", "")
+                if account_id.isdigit():
+                    accounts.add(account_id)
         return accounts
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Could not list state objects in S3: %s", exc)
@@ -580,33 +583,36 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
         state = load_state(s3_client, account_id, args.state_bucket) if s3_client else {}
         policies_state = state.get("policies", {})
 
-        response = iam.list_policies(Scope="Local")
-        for policy in response["Policies"]:
-            policy_name = policy["PolicyName"]
-            policy_arn = policy["Arn"]
+        # Use a paginator so orphan cx-mng=true policies that fall beyond the
+        # first 100-item page (iam:ListPolicies default MaxItems) are still
+        # evaluated for deletion.
+        for page in iam.get_paginator("list_policies").paginate(Scope="Local"):
+            for policy in page["Policies"]:
+                policy_name = policy["PolicyName"]
+                policy_arn = policy["Arn"]
 
-            if policy_name in keep_for_account:
-                continue
-            try:
-                tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
-                tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
-                # Only delete policies that this pipeline created.
-                if tags.get("cx-mng") != "true":
+                if policy_name in keep_for_account:
                     continue
+                try:
+                    tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
+                    tags = {t["Key"]: t["Value"] for t in tags_response["Tags"]}
+                    # Only delete policies that this pipeline created.
+                    if tags.get("cx-mng") != "true":
+                        continue
 
-                LOG.info("%s[%s] DELETE '%s'", log_prefix, account_id, policy_name)
-                if not args.dry_run:
-                    versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
-                    for version in versions:
-                        if not version["IsDefaultVersion"]:
-                            iam.delete_policy_version(
-                                PolicyArn=policy_arn, VersionId=version["VersionId"]
-                            )
-                    iam.delete_policy(PolicyArn=policy_arn)
-                    policies_state.pop(policy_name, None)
-                    LOG.info("[%s] '%s' deleted.", account_id, policy_name)
-            except Exception as exc:  # noqa: BLE001
-                LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
+                    LOG.info("%s[%s] DELETE '%s'", log_prefix, account_id, policy_name)
+                    if not args.dry_run:
+                        versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
+                        for version in versions:
+                            if not version["IsDefaultVersion"]:
+                                iam.delete_policy_version(
+                                    PolicyArn=policy_arn, VersionId=version["VersionId"]
+                                )
+                        iam.delete_policy(PolicyArn=policy_arn)
+                        policies_state.pop(policy_name, None)
+                        LOG.info("[%s] '%s' deleted.", account_id, policy_name)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
 
         if not args.dry_run and s3_client:
             state["account_id"] = account_id
