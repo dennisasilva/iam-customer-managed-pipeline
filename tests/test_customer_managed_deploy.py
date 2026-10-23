@@ -949,3 +949,111 @@ def test_create_update_handles_five_version_cap(
     default = next(v for v in versions_after if v["IsDefaultVersion"])
     fetched = iam.get_policy_version(PolicyArn=policy_arn, VersionId=default["VersionId"])
     assert fetched["PolicyVersion"]["Document"] == new_doc
+
+
+# --------------------------------------------------------------------------- #
+# Pagination regression tests
+#
+# Verify that both listing calls in delete_customer_managed_policy walk every
+# page: an orphan cx-mng=true policy must be deleted even when it falls past
+# the first iam:list_policies page, and get_previously_managed_accounts must
+# return every state key even when ListObjectsV2 would truncate at 1000 keys.
+# --------------------------------------------------------------------------- #
+
+
+@mock_aws
+def test_previously_managed_accounts_paginates_past_1000_keys(
+    deploy_module, aws_credentials
+):
+    """Accounts whose state keys fall beyond the first 1000-key page are still returned."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="state-bucket")
+
+    # Write 1100 state keys with lexicographically ordered account IDs so we
+    # know exactly which key would fall into the truncated tail.
+    account_ids = [f"{i:012d}" for i in range(1, 1101)]
+    for account_id in account_ids:
+        s3.put_object(
+            Bucket="state-bucket",
+            Key=f"state/{account_id}.json",
+            Body=b"{}",
+        )
+
+    accounts = deploy_module.get_previously_managed_accounts(s3, "state-bucket")
+
+    # Without pagination the last 100 would be missing.
+    assert len(accounts) == 1100
+    assert account_ids[-1] in accounts
+    assert account_ids[0] in accounts
+
+
+@mock_aws
+def test_delete_sweeps_orphan_policy_past_first_list_policies_page(
+    deploy_module, aws_credentials, tmp_path, monkeypatch
+):
+    """An orphan cx-mng=true policy must be deleted even when IAM paginates list_policies."""
+    _create_deploy_role()
+    iam = boto3.client("iam", region_name="us-east-1")
+
+    # Force iam.list_policies to return only one policy per page so we exercise
+    # pagination without having to create 100+ policies (moto honours MaxItems).
+    original_get_paginator = deploy_module.boto3.client("iam").get_paginator  # noqa: F841
+
+    # Pre-create a handful of padding policies and the orphan.  We lower the
+    # pagination page size in the deployed code's paginator by patching the
+    # paginator's PAGE_SIZE at call time.
+    for i in range(3):
+        iam.create_policy(
+            PolicyName=f"pad-{i}",
+            PolicyDocument=json.dumps(DEFAULT_POLICY_DOC),
+        )
+
+    orphan = iam.create_policy(
+        PolicyName="ZZOrphan",
+        PolicyDocument=json.dumps(DEFAULT_POLICY_DOC),
+    )
+    iam.tag_policy(
+        PolicyArn=orphan["Policy"]["Arn"],
+        Tags=[{"Key": "cx-mng", "Value": "true"}],
+    )
+
+    # Patch get_iam_client so list_policies returns one policy per page.
+    real_get_iam_client = deploy_module.get_iam_client
+
+    def _tiny_paginated_client(account_id):
+        client = real_get_iam_client(account_id)
+        real_get_paginator = client.get_paginator
+
+        def _patched_get_paginator(operation_name):
+            paginator = real_get_paginator(operation_name)
+            if operation_name == "list_policies":
+                original_paginate = paginator.paginate
+
+                def _patched_paginate(**kwargs):
+                    # Force a tiny page size so pagination is actually required
+                    # to see every policy, including the orphan.
+                    kwargs.setdefault("PaginationConfig", {})
+                    kwargs["PaginationConfig"] = {**kwargs["PaginationConfig"], "PageSize": 1}
+                    return original_paginate(**kwargs)
+
+                paginator.paginate = _patched_paginate
+            return paginator
+
+        client.get_paginator = _patched_get_paginator
+        return client
+
+    monkeypatch.setattr(deploy_module, "get_iam_client", _tiny_paginated_client)
+
+    # Assignment references a different policy, so ZZOrphan is truly orphaned.
+    assignments_folder = _write_assignment(
+        tmp_path / "assignments",
+        sid="X", target=[DEFAULT_ACCOUNT], policies=["OtherPolicy"],
+    )
+    policies_folder = _write_policy(tmp_path / "policies", name="OtherPolicy")
+    args = _build_args(assignments_folder=assignments_folder, policies_folder=policies_folder)
+
+    deploy_module.delete_customer_managed_policy(args)
+
+    names = [p["PolicyName"] for p in iam.list_policies(Scope="Local")["Policies"]]
+    # Orphan must be deleted even though it sits past the first page.
+    assert "ZZOrphan" not in names
