@@ -91,21 +91,23 @@ def test_get_target_accounts_exits_on_account_id_with_whitespace(
 def test_check_role_exists_returns_true_when_role_present(
     role_validation_module, aws_credentials
 ):
-    """If the role exists and is assumable, the function returns True."""
+    """If the deploy role exists and is assumable, the function returns True."""
     iam = boto3.client("iam", region_name="us-east-1")
-    iam.create_role(
-        RoleName=role_validation_module.ROLE_NAME,
-        AssumeRolePolicyDocument=json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "lambda.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }],
-        }),
-    )
+    trust = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    # The validation stage assumes the dedicated read-only role and from there
+    # calls iam:GetRole on the mutation-capable deploy role. Both must exist
+    # for the check to succeed.
+    iam.create_role(RoleName=role_validation_module.ROLE_NAME, AssumeRolePolicyDocument=trust)
+    iam.create_role(RoleName=role_validation_module.DEPLOY_ROLE_NAME, AssumeRolePolicyDocument=trust)
 
-    # moto STS lets you assume any role ARN; with the role created it will succeed.
+    # moto STS lets you assume any role ARN; with both roles created it will succeed.
     assert role_validation_module.check_role_exists("123456789012") is True
 
 
@@ -192,7 +194,7 @@ def test_check_role_exists_passes_external_id_when_env_var_set(
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
-    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.ROLE_NAME}}
+    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.DEPLOY_ROLE_NAME}}
 
     with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
         result = role_validation_module.check_role_exists("123456789012")
@@ -200,6 +202,10 @@ def test_check_role_exists_passes_external_id_when_env_var_set(
     assert result is True
     call_kwargs = sts_mock.assume_role.call_args.kwargs
     assert call_kwargs.get("ExternalId") == "test-external-id-1234567890"
+    # Defense-in-depth: a restrictive session Policy must be attached to
+    # every assume_role call so credentials are capped to IAM read actions.
+    assert "Policy" in call_kwargs
+    assert "iam:GetRole" in call_kwargs["Policy"]
 
 
 def test_check_role_exists_omits_external_id_when_env_var_unset(
@@ -210,7 +216,7 @@ def test_check_role_exists_omits_external_id_when_env_var_unset(
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
-    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.ROLE_NAME}}
+    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.DEPLOY_ROLE_NAME}}
 
     with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
         role_validation_module.check_role_exists("123456789012")

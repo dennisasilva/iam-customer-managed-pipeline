@@ -106,8 +106,12 @@ resource "aws_codebuild_project" "role_validation" {
 }
 
 resource "aws_codebuild_project" "dry_run" {
-  name         = "${var.naming_convention}-dry-run"
-  service_role = aws_iam_role.customer_managed_policies.arn
+  name = "${var.naming_convention}-dry-run"
+  # Dedicated service role whose sts:AssumeRole target is the read-only
+  # ``validate-customer-managed-policy`` role in each target account.
+  # The DryRun stage therefore cannot mutate IAM even if the
+  # customer-managed-deploy script is tampered with (CWE-653).
+  service_role = aws_iam_role.dry_run.arn
 
   artifacts { type = "CODEPIPELINE" }
 
@@ -126,6 +130,13 @@ resource "aws_codebuild_project" "dry_run" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    # Point the deploy script at the read-only cross-account role so STS
+    # itself refuses any mutating IAM call, independent of the ``--dry-run``
+    # client-side guard.
+    environment_variable {
+      name  = "TARGET_ROLE_NAME"
+      value = "validate-customer-managed-policy"
     }
   }
 

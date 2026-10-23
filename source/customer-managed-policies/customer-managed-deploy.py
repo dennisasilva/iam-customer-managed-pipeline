@@ -81,7 +81,14 @@ DEFAULT_POLICIES_DIR = "../../templates/customer-managed-policies"
 
 # Cross-account role assumed by the pipeline in every target account. Created by
 # the ``cx-mng-stackset-deploy-role.yaml`` StackSet.
-ROLE_NAME = "deploy-customer-managed-policy"
+#
+# The apply stage uses the mutation-capable ``deploy-customer-managed-policy``
+# role (default below). The DryRun stage runs the same script with the
+# ``TARGET_ROLE_NAME`` environment variable set to the read-only
+# ``validate-customer-managed-policy`` role, so a tampered dry-run cannot
+# mutate IAM even if the ``--dry-run`` client-side guard is removed.
+DEFAULT_ROLE_NAME = "deploy-customer-managed-policy"
+ROLE_NAME = os.environ.get("TARGET_ROLE_NAME", DEFAULT_ROLE_NAME)
 
 
 # --------------------------------------------------------------------------- #

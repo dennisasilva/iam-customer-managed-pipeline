@@ -79,20 +79,21 @@ resource "aws_codepipeline" "pipeline" {
     }
   }
 
-  # Estágio de aprovação manual — incluído apenas quando manual_approval = true.
-  dynamic "stage" {
-    for_each = var.manual_approval ? [1] : []
-    content {
-      name = "Approval"
-      action {
-        name     = "Approval"
-        category = "Approval"
-        owner    = "AWS"
-        provider = "Manual"
-        version  = "1"
-        configuration = {
-          CustomData = "Review DryRun logs and approve before deploying customer managed policies."
-        }
+  # Estágio de aprovação manual — agora OBRIGATÓRIO. Os estágios RoleValidation
+  # e DryRun que rodam antes dele executam Python controlado pelo repositório;
+  # um humano precisa gatilhar toda mudança em produção (CWE-653 /
+  # separação de funções). A variável ``manual_approval`` foi mantida para
+  # compatibilidade de inputs, mas está obsoleta e é ignorada.
+  stage {
+    name = "Approval"
+    action {
+      name     = "Approval"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+      configuration = {
+        CustomData = "Review DryRun logs and approve before deploying customer managed policies."
       }
     }
   }

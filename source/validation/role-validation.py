@@ -42,7 +42,50 @@ LOG = logging.getLogger(__name__)
 
 # Name of the IAM role expected to exist in each target account. Created by
 # the ``cx-mng-stackset-deploy-role.yaml`` StackSet.
-ROLE_NAME = "deploy-customer-managed-policy"
+#
+# This stage runs BEFORE the manual-approval gate, so it deliberately targets
+# the dedicated read-only ``validate-customer-managed-policy`` role rather
+# than the mutation-capable ``deploy-customer-managed-policy``. Even if a
+# repository writer tampers with this script, the credentials it can obtain
+# are limited to IAM read actions by the role's inline policy.
+#
+# The ``TARGET_ROLE_NAME`` environment variable allows the pipeline (or local
+# runs) to override the role name without editing the script — kept for
+# forward-compatibility; the production pipeline passes the read-only role.
+DEFAULT_ROLE_NAME = "validate-customer-managed-policy"
+ROLE_NAME = os.environ.get("TARGET_ROLE_NAME", DEFAULT_ROLE_NAME)
+
+# The deploy role whose presence this stage ultimately asserts. The stage
+# assumes the read-only ``validate-customer-managed-policy`` role and from
+# there calls ``iam:GetRole`` on ``deploy-customer-managed-policy`` to confirm
+# the StackSet landed in the target account before the apply stage runs.
+DEPLOY_ROLE_NAME = "deploy-customer-managed-policy"
+
+# Defense-in-depth session policy applied to every ``sts:AssumeRole`` call
+# from this validation stage. Even if the trust/inline policies ever regress
+# (e.g. the script is pointed at the mutation role by mistake), the session
+# credentials are capped by this policy to IAM read-only actions. The
+# effective permission set is the intersection of the role's inline policy
+# and this session policy, so widening one does not widen the other.
+SESSION_POLICY_READ_ONLY = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "iam:GetRole",
+                    "iam:GetPolicy",
+                    "iam:GetPolicyVersion",
+                    "iam:ListPolicies",
+                    "iam:ListPolicyTags",
+                    "iam:ListPolicyVersions",
+                ],
+                "Resource": "*",
+            }
+        ],
+    }
+)
 
 # AWS account IDs are exactly 12 digits. Defense-in-depth: this script may run
 # without the upstream TemplateValidation stage (e.g. local debugging), so we
@@ -142,6 +185,10 @@ def check_role_exists(account_id: str) -> bool:
         assume_role_kwargs = {
             "RoleArn": f"arn:aws:iam::{account_id}:role/{ROLE_NAME}",
             "RoleSessionName": _build_session_name("CxMngValidate"),
+            # Defense-in-depth: cap the session to IAM read actions so a
+            # tampered script cannot mutate even if it is somehow pointed at
+            # a role whose inline policy is wider than expected.
+            "Policy": SESSION_POLICY_READ_ONLY,
         }
         external_id = os.environ.get("EXTERNAL_ID")
         if external_id:
@@ -155,11 +202,17 @@ def check_role_exists(account_id: str) -> bool:
             aws_session_token=creds["SessionToken"],
             config=BOTO3_CONFIG,
         )
-        iam.get_role(RoleName=ROLE_NAME)
-        LOG.info("[%s] Role '%s' validated successfully.", account_id, ROLE_NAME)
+        iam.get_role(RoleName=DEPLOY_ROLE_NAME)
+        LOG.info(
+            "[%s] Role '%s' validated successfully (via read-only role '%s').",
+            account_id, DEPLOY_ROLE_NAME, ROLE_NAME,
+        )
         return True
     except (ClientError, BotoCoreError) as exc:
-        LOG.error("[%s] Role '%s' is not accessible: %s", account_id, ROLE_NAME, exc)
+        LOG.error(
+            "[%s] Role '%s' is not accessible (via '%s'): %s",
+            account_id, DEPLOY_ROLE_NAME, ROLE_NAME, exc,
+        )
         return False
 
 
@@ -175,7 +228,8 @@ def main() -> int:
     failures = [acct for acct in accounts if not check_role_exists(acct)]
     if failures:
         LOG.error(
-            "Role '%s' is missing or not accessible on accounts: %s", ROLE_NAME, failures
+            "Role '%s' is missing or not accessible on accounts: %s",
+            DEPLOY_ROLE_NAME, failures,
         )
         LOG.error("Make sure the StackSet has created the role on these accounts.")
         return 1

@@ -80,13 +80,49 @@ resource "aws_iam_role_policy" "role_validation" {
       {
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
+        # RoleValidation runs BEFORE the manual approval gate on untrusted
+        # repository Python; it may only assume the read-only role. Mutations
+        # are IAM-impossible even if the script is tampered with (CWE-653).
+        Resource = local.validate_role_arn
       },
     ]
   })
 }
 
-# ---------- Customer Managed Policies (deploy + dry-run) ----------
+# ---------- Dry Run (pre-approval, read-only) ----------
+resource "aws_iam_role" "dry_run" {
+  name               = "${var.naming_convention}-dry-run"
+  description        = "CodeBuild role for the DryRun CodeBuild Project. Can assume ONLY the read-only cross-account validation role so a tampered dry-run cannot mutate IAM."
+  path               = "/"
+  assume_role_policy = local.codebuild_assume
+}
+
+resource "aws_iam_role_policy" "dry_run" {
+  name = "CodeBuildPolicy"
+  role = aws_iam_role.dry_run.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      local.logs_statement,
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
+      },
+      local.kms_via_s3_statement,
+      {
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        # DryRun runs BEFORE the manual approval gate on untrusted repository
+        # Python; it may only assume the read-only role so a tampered dry-run
+        # cannot mutate IAM.
+        Resource = local.validate_role_arn
+      },
+    ]
+  })
+}
+
+# ---------- Customer Managed Policies (apply stage only) ----------
 resource "aws_iam_role" "customer_managed_policies" {
   name               = "${var.naming_convention}-customer-managed-policies"
   description        = "CodeBuild role for Customer Managed Policies CodeBuild Project"

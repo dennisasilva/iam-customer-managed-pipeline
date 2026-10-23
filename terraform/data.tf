@@ -14,6 +14,10 @@ locals {
   # ARN da role cross-account de deploy (criada nas contas-alvo).
   deploy_role_arn = "arn:aws:iam::*:role/deploy-customer-managed-policy"
 
+  # ARN da role cross-account de validação (read-only), usada pelos estágios
+  # RoleValidation e DryRun antes da aprovação manual.
+  validate_role_arn = "arn:aws:iam::*:role/validate-customer-managed-policy"
+
   # Seleciona a conexão CodeStar de acordo com o tipo de repositório.
   is_github      = var.repository_type == "GitHub"
   connection_arn = local.is_github ? aws_codestarconnections_connection.github[0].arn : aws_codestarconnections_connection.gitlab[0].arn

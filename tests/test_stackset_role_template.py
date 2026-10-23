@@ -119,3 +119,81 @@ def test_no_wildcard_resource_on_destructive_statements(role_statements):
                 f"Destructive statement Sid={statement.get('Sid')} uses "
                 f"Resource '*' instead of an account-scoped ARN"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Compartmentalization split (CWE-653): the pre-approval RoleValidation and
+# DryRun stages must use a dedicated read-only role, and the mutation-capable
+# deploy role must trust only the apply-stage principal.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def resources() -> dict:
+    with open(TEMPLATE, "r", encoding="utf-8") as fh:
+        doc = yaml.load(fh, Loader=_CfnLoader)
+    return doc["Resources"]
+
+
+def _principal_arns(role: dict) -> list:
+    trust = role["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]
+    aws = trust["Principal"]["AWS"]
+    return aws if isinstance(aws, list) else [aws]
+
+
+def test_validate_role_exists_as_separate_resource(resources):
+    """A dedicated read-only role must be defined for pre-approval stages."""
+    assert "ValidateCustomerManagedPolicyRole" in resources, (
+        "Missing read-only ValidateCustomerManagedPolicyRole — pre-approval "
+        "stages would still receive mutation-capable credentials (CWE-653)."
+    )
+
+
+def test_deploy_role_trust_excludes_role_validation_principal(resources):
+    """deploy-customer-managed-policy must NOT be assumable by RoleValidation / DryRun."""
+    arns = _principal_arns(resources["DeployCustomerManagedPolicyRole"])
+    for arn in arns:
+        assert "-role-validation" not in arn, (
+            "RoleValidation principal is still trusted by the mutation-capable "
+            "deploy role (CWE-653). It must be moved to the read-only validate role."
+        )
+        assert "-dry-run" not in arn, (
+            "DryRun principal is still trusted by the mutation-capable deploy role."
+        )
+    # Positive assertion: the apply-stage principal remains trusted.
+    assert any("-customer-managed-policies" in a for a in arns), (
+        "Apply-stage principal must remain trusted by deploy-customer-managed-policy."
+    )
+
+
+def test_validate_role_trust_excludes_apply_principal(resources):
+    """validate-customer-managed-policy must NOT be assumable by the apply-stage principal."""
+    arns = _principal_arns(resources["ValidateCustomerManagedPolicyRole"])
+    for arn in arns:
+        assert "-customer-managed-policies" not in arn, (
+            "Apply principal must not be able to assume the read-only validate role."
+        )
+
+
+def test_validate_role_inline_policy_has_no_mutating_actions(resources):
+    """Read-only role must grant only IAM read actions — no mutations ever."""
+    role = resources["ValidateCustomerManagedPolicyRole"]
+    statements = []
+    for policy in role["Properties"]["Policies"]:
+        statements.extend(policy["PolicyDocument"]["Statement"])
+    forbidden = {
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:TagPolicy",
+        "iam:UntagPolicy",
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy",
+    }
+    for statement in statements:
+        leaked = _actions(statement) & forbidden
+        assert not leaked, (
+            f"ValidateCustomerManagedPolicyRole grants mutating actions {leaked} "
+            f"in statement Sid={statement.get('Sid')}; it must be read-only."
+        )

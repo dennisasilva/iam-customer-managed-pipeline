@@ -105,7 +105,10 @@
       ConstraintDescription: 'Must be lowercase, start with a letter, end with a letter or number, contain only letters/numbers/hyphens (2-30 chars).'
 
     ManualApproval:
-      Description: 'Enable manual approval stage before deploying customer managed policies'
+      Description: >-
+        DEPRECATED — the manual approval stage is now mandatory and this
+        parameter is ignored. Kept with a default of 'true' only so existing
+        stack updates do not fail parameter validation.
       Type: String
       AllowedValues:
         - 'true'
@@ -119,7 +122,6 @@
   Conditions:
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
-    cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
 
   Resources:
 
@@ -253,7 +255,11 @@
               reason: The CodeBuild is going to use the AWS Managed key.
       Properties:
         Name: !Sub "${NamingConvention}-dry-run"
-        ServiceRole: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
+        # Dedicated service role whose sts:AssumeRole target is the read-only
+        # ``validate-customer-managed-policy`` role in each target account.
+        # The DryRun stage therefore cannot mutate IAM even if the
+        # customer-managed-deploy script is tampered with (CWE-653).
+        ServiceRole: !GetAtt CodeBuildRoleDryRun.Arn
         Environment:
           Type: LINUX_CONTAINER
           ComputeType: BUILD_GENERAL1_SMALL
@@ -265,6 +271,11 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            # Point the deploy script at the read-only cross-account role so
+            # STS itself refuses any mutating IAM call, independent of the
+            # ``--dry-run`` client-side guard.
+            - Name: TARGET_ROLE_NAME
+              Value: validate-customer-managed-policy
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -383,7 +394,77 @@
                 - Effect: Allow
                   Action:
                     - sts:AssumeRole
-                  Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # The RoleValidation stage runs BEFORE the manual approval
+                  # gate on untrusted (repository-controlled) Python; it may
+                  # therefore only assume the dedicated read-only cross-account
+                  # role. Mutations are IAM-impossible even if the script is
+                  # tampered with (CWE-653 compartmentalization control).
+                  Resource: "arn:aws:iam::*:role/validate-customer-managed-policy"
+
+  ## +--------------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild role for DryRunCodeBuildProject project             | ##
+  ## +--------------------------------------------------------------------------+ ##
+
+    CodeBuildRoleDryRun:
+      Type: AWS::IAM::Role
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: The IAM permissions associate is under review.
+            - id: W28
+              reason: The IAM role is used by CodeBuild project.
+      Properties:
+        RoleName: !Sub "${NamingConvention}-dry-run"
+        Description: CodeBuild role for the DryRun CodeBuild Project. Can assume ONLY the read-only cross-account validation role so a tampered dry-run cannot mutate IAM.
+        Path: /
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CodeBuildPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Required because the artifact bucket is encrypted with
+                  # SSE-KMS (alias/aws/s3). The kms:ViaService condition
+                  # restricts these permissions to KMS calls made by S3 in
+                  # this region only.
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                - Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+                  # DryRun runs BEFORE the manual approval gate on untrusted
+                  # repository-controlled Python; it may only assume the
+                  # dedicated read-only role. STS itself refuses any mutating
+                  # IAM call attempted by a tampered dry-run script.
+                  Resource: "arn:aws:iam::*:role/validate-customer-managed-policy"
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -794,19 +875,21 @@
                 OutputArtifacts:
                   - Name: DryRunOutput
 
-          - !If
-            - cManualApproval
-            - Name: Approval
-              Actions:
-                - Name: Approval
-                  ActionTypeId:
-                    Category: Approval
-                    Owner: AWS
-                    Version: '1'
-                    Provider: Manual
-                  Configuration:
-                    CustomData: "Review DryRun logs and approve before deploying customer managed policies."
-            - !Ref AWS::NoValue
+          # Manual approval is mandatory: the RoleValidation and DryRun stages
+          # that run before it execute attacker-controllable repository Python,
+          # so a human must gate every production change (CWE-653 /
+          # separation-of-duties control). The previous ManualApproval=false
+          # option has been removed; the stage is always present.
+          - Name: Approval
+            Actions:
+              - Name: Approval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Version: '1'
+                  Provider: Manual
+                Configuration:
+                  CustomData: "Review DryRun logs and approve before deploying customer managed policies."
 
           - Name: CustomerManagedPolicies
             Actions:

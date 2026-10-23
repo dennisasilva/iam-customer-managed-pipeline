@@ -55,6 +55,77 @@ variable "external_id" {
 
 data "aws_caller_identity" "current" {}
 
+# ---------------------------------------------------------------------------
+# Read-only role used by the pre-approval RoleValidation and DryRun stages.
+# Separating this from the mutation-capable deploy role is a CWE-653
+# compartmentalization control: a tampered pre-approval script can obtain at
+# most these IAM read actions and cannot create/modify/delete any IAM policy.
+# ---------------------------------------------------------------------------
+resource "aws_iam_role" "validate" {
+  name        = "validate-customer-managed-policy"
+  description = "Read-only role assumed by the pipeline pre-approval validation and dry-run stages to inspect IAM customer-managed policies in this account."
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        # Only the two pre-approval CodeBuild service roles may assume this
+        # read-only role; the apply-stage principal is intentionally excluded.
+        AWS = [
+          "arn:aws:iam::${var.pipeline_account_id}:role/${var.naming_convention}-role-validation",
+          "arn:aws:iam::${var.pipeline_account_id}:role/${var.naming_convention}-dry-run",
+        ]
+      }
+      Action = "sts:AssumeRole"
+      Condition = {
+        StringEquals = { "sts:ExternalId" = var.external_id }
+      }
+    }]
+  })
+
+  tags = {
+    "cx-mng"    = "true"
+    "ManagedBy" = "sso-pipeline"
+  }
+}
+
+resource "aws_iam_role_policy" "validate" {
+  name = "customer-managed-policy-validate"
+  role = aws_iam_role.validate.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "IAMPolicyReadOnly"
+        Effect = "Allow"
+        Action = [
+          "iam:GetRole",
+          "iam:GetPolicy",
+          "iam:GetPolicyVersion",
+          "iam:ListPolicies",
+          "iam:ListPolicyTags",
+          "iam:ListPolicyVersions",
+        ]
+        Resource = [
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/*",
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/deploy-customer-managed-policy",
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/validate-customer-managed-policy",
+        ]
+      },
+    ]
+  })
+}
+
+output "validate_role_arn" {
+  description = "ARN da role de validação (read-only) criada nesta conta."
+  value       = aws_iam_role.validate.arn
+}
+
+# ---------------------------------------------------------------------------
+# Mutation-capable role used ONLY by the post-approval apply stage.
+# RoleValidation and DryRun principals are intentionally NOT trusted here.
+# ---------------------------------------------------------------------------
 resource "aws_iam_role" "deploy" {
   name        = "deploy-customer-managed-policy"
   description = "Role assumed by the pipeline to manage IAM customer-managed policies in this account."
@@ -65,7 +136,8 @@ resource "aws_iam_role" "deploy" {
       Effect = "Allow"
       Principal = {
         AWS = [
-          "arn:aws:iam::${var.pipeline_account_id}:role/${var.naming_convention}-role-validation",
+          # Only the apply-stage CodeBuild service role may assume this
+          # mutation-capable role.
           "arn:aws:iam::${var.pipeline_account_id}:role/${var.naming_convention}-customer-managed-policies",
         ]
       }

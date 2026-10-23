@@ -30,6 +30,69 @@ Parameters:
     ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
 
 Resources:
+  # Read-only role used by the pre-approval RoleValidation and DryRun stages.
+  # Separating this from the mutation-capable deploy role is a CWE-653
+  # compartmentalization control: even if a repository writer tampers with the
+  # scripts those stages run, the credentials they can obtain are limited to
+  # the IAM read actions below and cannot create, modify or delete any IAM
+  # policy in this account.
+  ValidateCustomerManagedPolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: validate-customer-managed-policy
+      Description: 'Read-only role assumed by the pipeline pre-approval validation and dry-run stages to inspect IAM customer-managed policies in this account.'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                # Only the two pre-approval CodeBuild service roles may assume
+                # this read-only role; the apply-stage principal is intentionally
+                # excluded so that the validate role cannot be used as a backdoor.
+                - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-role-validation'
+                - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-dry-run'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                # ExternalId acts as a shared secret. Even if the pipeline
+                # account is compromised, an attacker holding only the role
+                # ARN cannot assume this role without also knowing the
+                # ExternalId value (which lives in Secrets-Manager-backed
+                # NoEcho parameters on both stacks).
+                'sts:ExternalId': !Ref ExternalId
+      Policies:
+        - PolicyName: customer-managed-policy-validate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IAMPolicyReadOnly
+                Effect: Allow
+                Action:
+                  # Minimal read set required by role-validation.py and the
+                  # dry-run path of customer-managed-deploy.py. No mutating
+                  # actions, no iam:Attach*/PutRolePolicy. Any attempt to
+                  # mutate IAM from a tampered pre-approval script fails at
+                  # the IAM authorization layer.
+                  - iam:GetRole
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicies
+                  - iam:ListPolicyTags
+                  - iam:ListPolicyVersions
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/deploy-customer-managed-policy'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/validate-customer-managed-policy'
+      Tags:
+        - Key: cx-mng
+          Value: 'true'
+        - Key: ManagedBy
+          Value: sso-pipeline
+
+  # Mutation-capable role used ONLY by the post-approval CustomerManagedPolicies
+  # (apply) stage. The RoleValidation and DryRun principals are intentionally
+  # NOT trusted here so a tampered pre-approval script cannot mutate IAM.
   DeployCustomerManagedPolicyRole:
     Type: AWS::IAM::Role
     Properties:
@@ -41,7 +104,9 @@ Resources:
           - Effect: Allow
             Principal:
               AWS:
-                - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-role-validation'
+                # Only the apply-stage CodeBuild service role may assume this
+                # mutation-capable role. The pre-approval RoleValidation and
+                # DryRun principals use the separate read-only role above.
                 - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-customer-managed-policies'
             Action: sts:AssumeRole
             Condition:
