@@ -54,6 +54,70 @@ logging.basicConfig(
 LOG = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Run-level failure tracking
+# --------------------------------------------------------------------------- #
+#
+# The deploy must fail the CodePipeline stage (non-zero exit) when the live
+# IAM resource diverged from the reviewed repository document (drift), was
+# absent, could not be read, or could not be remediated. We also publish an
+# alert so operators notice the broken-invariant case even if the stage is
+# auto-retried. Per-policy exceptions are still caught and logged so one bad
+# account does not stop the rest of the run — they are just now recorded here.
+_run_failures: list = []
+
+
+def _reset_run_failures() -> None:
+    """Reset the module-level failure list (called at the start of main())."""
+    _run_failures.clear()
+
+
+def record_run_failure(account_id: str, policy_name: str, kind: str, detail: str = "") -> None:
+    """Record a drift / absence / remediation failure for a single (account, policy).
+
+    ``kind`` is one of ``drift``, ``absent``, ``read_failed``, ``remediation_failed``.
+    The run will exit non-zero and emit an alert when any failures are recorded.
+    """
+    _run_failures.append(
+        {
+            "account_id": account_id,
+            "policy_name": policy_name,
+            "kind": kind,
+            "detail": detail,
+        }
+    )
+
+
+def _publish_failure_alert(failures: list) -> None:
+    """Best-effort alert when drift/absence/remediation failures were recorded.
+
+    Publishes to the SNS topic in ``ALERT_TOPIC_ARN`` when set. Alerting is a
+    best-effort side-channel: a publish failure must not mask the main non-zero
+    exit (which is what actually fails the pipeline stage).
+    """
+    topic_arn = os.environ.get("ALERT_TOPIC_ARN")
+    if not topic_arn or not failures:
+        return
+    try:
+        sns = boto3.client("sns", config=BOTO3_CONFIG)
+        subject = "customer-managed-policies: drift or remediation failure"[:100]
+        sns.publish(
+            TopicArn=topic_arn,
+            Subject=subject,
+            Message=json.dumps(
+                {
+                    "message": "customer-managed-policies deploy detected drift/absence/remediation failures",
+                    "codebuild_build_id": os.environ.get("CODEBUILD_BUILD_ID", "local"),
+                    "failure_count": len(failures),
+                    "failures": failures,
+                },
+                indent=2,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - alerting must not override the main exit code
+        LOG.error("Could not publish failure alert to %s: %s", topic_arn, exc)
+
+
 # botocore client config used everywhere in this script:
 #   * 10s connect / 30s read timeouts so a single unreachable account does not
 #     stall the build until the CodeBuild TimeoutInMinutes (480) kicks in.
@@ -247,13 +311,20 @@ def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict)
 
 
 def get_current_policy_doc(iam_client, policy_arn: str):
-    """Return the document of the default version of ``policy_arn``, or None on error."""
+    """Return the document of the default version of ``policy_arn``.
+
+    Returns ``None`` when the policy does *not* exist (``NoSuchEntity`` from IAM).
+    Any other exception — AccessDenied, throttling, transient boto errors, etc. —
+    is re-raised so the caller can distinguish "policy absent" from "read failed",
+    treat the latter as a drift/remediation failure, and fail the pipeline stage
+    instead of silently assuming the live resource matches the repository.
+    """
     try:
         policy = iam_client.get_policy(PolicyArn=policy_arn)
         version_id = policy["Policy"]["DefaultVersionId"]
         version = iam_client.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)
         return version["PolicyVersion"]["Document"]
-    except Exception:  # noqa: BLE001 - any failure means "no document available"
+    except iam_client.exceptions.NoSuchEntityException:
         return None
 
 
@@ -343,25 +414,59 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                     path = policy_data.get("Path", "/")
                     description = policy_data.get("Description", "Custom managed policy")
 
-                    # Fast path: state hash matches repo hash, so the document hasn't
-                    # changed since the last deploy. Skip the update and just check drift.
+                    # Fast path: state hash matches repo hash. But cached state is
+                    # not authoritative — a privileged principal in the member
+                    # account can mutate or delete the live policy out-of-band, so
+                    # we must compare against the live document, not the cache.
+                    # If the live document matches the repo document we can safely
+                    # skip the create_policy_version call (which avoids burning IAM
+                    # policy versions). Any divergence — drift, policy deleted, or
+                    # unreadable — falls through to the normal update/create branch
+                    # below so the reviewed document is re-applied.
                     saved = policies_state.get(policy_name, {})
+                    policy_arn = f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
                     if saved.get("policy_hash") == repo_hash:
-                        LOG.info(
-                            "%s[%s] '%s' unchanged (hash match). Skipping.",
-                            log_prefix, account_id, policy_name,
-                        )
-                        current_doc = get_current_policy_doc(
-                            iam, f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
-                        )
-                        if current_doc and policy_hash(current_doc) != repo_hash:
+                        try:
+                            current_doc = get_current_policy_doc(iam, policy_arn)
+                        except Exception as exc:  # noqa: BLE001
+                            # Unexplained read failure (e.g. AccessDenied, throttling).
+                            # We cannot assert the live resource matches the repo,
+                            # so flag this run as failed and move on. Do NOT attempt
+                            # a blind update — we have no evidence of the live state.
+                            LOG.error(
+                                "%s[%s] Could not read live policy '%s' to verify state: %s",
+                                log_prefix, account_id, policy_name, exc,
+                            )
+                            record_run_failure(
+                                account_id, policy_name, "read_failed", str(exc)
+                            )
+                            continue
+                        if current_doc is None:
+                            # Policy was deleted in the member account despite cached
+                            # state claiming it is deployed. Flag the run as failed
+                            # and fall through to the create branch to recreate it.
                             LOG.warning(
-                                "%s[%s] DRIFT detected on '%s'!",
+                                "%s[%s] ABSENCE detected on '%s' (cached state is stale)! Recreating.",
                                 log_prefix, account_id, policy_name,
                             )
-                        continue
+                            record_run_failure(account_id, policy_name, "absent")
+                            # Fall through to the create/update branch below.
+                        elif policy_hash(current_doc) != repo_hash:
+                            # Live document was mutated out-of-band. Flag the run as
+                            # failed and fall through to re-apply the reviewed doc.
+                            LOG.warning(
+                                "%s[%s] DRIFT detected on '%s'! Re-applying reviewed document.",
+                                log_prefix, account_id, policy_name,
+                            )
+                            record_run_failure(account_id, policy_name, "drift")
+                            # Fall through to the create/update branch below.
+                        else:
+                            LOG.info(
+                                "%s[%s] '%s' unchanged (hash match, live doc verified). Skipping.",
+                                log_prefix, account_id, policy_name,
+                            )
+                            continue
 
-                    policy_arn = f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
                     try:
                         iam.get_policy(PolicyArn=policy_arn)
                         tags_response = iam.list_policy_tags(PolicyArn=policy_arn)
@@ -430,6 +535,9 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
 
                     except Exception as exc:  # noqa: BLE001 - per-policy failures must not stop the run
                         LOG.error("[%s] Error on '%s': %s", account_id, policy_name, exc)
+                        record_run_failure(
+                            account_id, policy_name, "remediation_failed", str(exc)
+                        )
 
                 if not args.dry_run and s3_client:
                     state["account_id"] = account_id
@@ -529,6 +637,9 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                     LOG.info("[%s] '%s' deleted.", account_id, policy_name)
             except Exception as exc:  # noqa: BLE001
                 LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
+                record_run_failure(
+                    account_id, policy_name, "remediation_failed", f"delete: {exc}"
+                )
 
         if not args.dry_run and s3_client:
             state["account_id"] = account_id
@@ -552,10 +663,25 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update then delete.
+
+    Returns a non-zero exit code when any drift, out-of-band deletion, read
+    failure, or per-policy remediation error was recorded, so the CodePipeline
+    stage fails loudly instead of logging a warning that nobody reads. A
+    best-effort SNS alert is published when ``ALERT_TOPIC_ARN`` is set.
+    """
+    _reset_run_failures()
     args = parse_args()
     create_update_customer_managed_policy(args)
     delete_customer_managed_policy(args)
+    if _run_failures:
+        LOG.error(
+            "customer-managed-policies deploy finished with %d failure(s): %s",
+            len(_run_failures),
+            _run_failures,
+        )
+        _publish_failure_alert(list(_run_failures))
+        return 1
     return 0
 
 
