@@ -55,6 +55,62 @@ POLICY_PATH_MAX_LENGTH = 512
 # to confusing AccessDenied errors at runtime when assume_role fails.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# Name of the environment variable that pins the set of AWS account IDs the
+# pipeline is allowed to deploy to. Populated by the pipeline infrastructure
+# (CodeBuild env var / CloudFormation parameter / Terraform variable) from a
+# location that is NOT writable through this GitOps repository. Format: a
+# comma-, whitespace-, or newline-separated list of 12-digit account IDs,
+# optionally prefixed with ``account/`` or similar labels that will be ignored.
+#
+# Enforcement rules in ``validate_target_account_ids``:
+#   * Set and non-empty  -> every Target entry must be in the allowlist.
+#   * Set but empty / blank -> hard failure (no deploy target is permitted).
+#   * Unset               -> loud warning and skip the allowlist check so that
+#                            local invocations (``python3 ... --assignments-folder
+#                            ...``) and the existing unit tests keep working.
+#                            The pipeline buildspec MUST set this variable;
+#                            relying on the unset-fallback in production is a
+#                            misconfiguration.
+ALLOWED_TARGET_ACCOUNT_IDS_ENV = "ALLOWED_TARGET_ACCOUNT_IDS"
+
+
+def _parse_allowed_accounts(raw: str) -> set:
+    """Return the set of 12-digit account IDs parsed from ``raw``.
+
+    Accepts comma, semicolon, whitespace, and newline as separators so the
+    same env var value works whether sourced from a one-line CodeBuild
+    environment variable or a multi-line SSM parameter. Entries that are not
+    exactly 12 digits (after stripping whitespace) are discarded with a
+    warning; silently discarding them in a loader would hide typos, so we
+    log them and the caller treats "no valid entries" as a hard failure.
+    """
+    tokens = re.split(r"[\s,;]+", raw.strip())
+    allowed: set = set()
+    for token in tokens:
+        if not token:
+            continue
+        if ACCOUNT_ID_PATTERN.match(token):
+            allowed.add(token)
+        else:
+            LOG.warning(
+                "Ignoring non-12-digit entry %r in %s.",
+                token, ALLOWED_TARGET_ACCOUNT_IDS_ENV,
+            )
+    return allowed
+
+
+def get_allowed_target_accounts() -> "set | None":
+    """Return the pinned allowlist, or ``None`` when the env var is unset.
+
+    ``None`` signals "no allowlist available in this environment"; callers
+    decide whether to warn-and-skip (local/CI unit tests) or fail-closed
+    (production pipeline buildspec).
+    """
+    raw = os.environ.get(ALLOWED_TARGET_ACCOUNT_IDS_ENV)
+    if raw is None:
+        return None
+    return _parse_allowed_accounts(raw)
+
 
 def parse_args() -> argparse.Namespace:
     """Parse and return the command-line arguments."""
@@ -195,6 +251,17 @@ def validate_target_account_ids(assignments: dict) -> None:
     time gives the operator a clear, file-scoped error message instead.
     """
     errors: list = []
+    allowed_accounts = get_allowed_target_accounts()
+
+    # Fail-closed if the allowlist was supplied but is empty / blank. We do
+    # this before the per-account loop so the operator gets a precise error
+    # pointing at the configuration, not a cascade of "not in allowlist" per
+    # Target entry.
+    if allowed_accounts is not None and not allowed_accounts:
+        raise ValueError(
+            f"{ALLOWED_TARGET_ACCOUNT_IDS_ENV} is set but contains no valid "
+            f"12-digit account IDs; refusing to proceed with no permitted targets."
+        )
 
     for filename, data in assignments.items():
         if not isinstance(data, dict):
@@ -224,6 +291,16 @@ def validate_target_account_ids(assignments: dict) -> None:
                         f"{filename}#{sid}: invalid account ID {account_id!r} "
                         f"(must be exactly 12 digits, no leading/trailing whitespace)"
                     )
+                elif allowed_accounts is not None and account_id not in allowed_accounts:
+                    # Format-valid but not in the pinned allowlist. The
+                    # pipeline must only ever assume into accounts it has
+                    # been pre-authorized for, so this is a hard failure.
+                    errors.append(
+                        f"{filename}#{sid}: account ID {account_id!r} is not in the "
+                        f"authoritative allowlist ({ALLOWED_TARGET_ACCOUNT_IDS_ENV}). "
+                        f"Add it to the pipeline configuration (CodeBuild env var / "
+                        f"SSM parameter) before deploying to this account."
+                    )
 
     if errors:
         for err in errors:
@@ -232,7 +309,18 @@ def validate_target_account_ids(assignments: dict) -> None:
             f"Invalid Target account ID in {len(errors)} entry(ies)."
         )
 
-    LOG.info("All Target account IDs are valid.")
+    if allowed_accounts is None:
+        LOG.warning(
+            "%s is not set; Target account IDs were only format-checked. "
+            "The pipeline buildspec MUST set this variable to the pinned "
+            "allowlist of managed account IDs in production.",
+            ALLOWED_TARGET_ACCOUNT_IDS_ENV,
+        )
+    else:
+        LOG.info(
+            "All Target account IDs are valid and present in the allowlist (%d accounts).",
+            len(allowed_accounts),
+        )
 
 
 def main() -> int:

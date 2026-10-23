@@ -10,4 +10,15 @@ branch_name       = "main"
 naming_convention = "cx-mng-pipeline"
 manual_approval   = true
 
+# Lista autoritativa (pinned) de contas-alvo onde a pipeline tem permissão
+# de deploy. Quando preenchida, os scripts de validation/deploy rejeitam
+# qualquer Target em templates/assignments/*.json que não esteja aqui e as
+# policies IAM dos CodeBuild roles passam a listar explicitamente apenas
+# essas ARNs em sts:AssumeRole (sem curinga arn:aws:iam::*:...).
+# allowed_target_account_ids = [
+#   "111111111111",
+#   "222222222222",
+#   "444444444444",
+# ]
+
 # external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"

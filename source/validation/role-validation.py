@@ -49,6 +49,28 @@ ROLE_NAME = "deploy-customer-managed-policy"
 # re-validate before any STS call.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# See customer-managed-validation.py for the rationale and format of this
+# environment variable. We re-read it here so that even if TemplateValidation
+# is skipped or bypassed (local run, split pipeline, future refactor), the
+# cross-account STS calls below cannot be pointed at an unapproved account.
+ALLOWED_TARGET_ACCOUNT_IDS_ENV = "ALLOWED_TARGET_ACCOUNT_IDS"
+
+
+def _get_allowed_target_accounts():
+    """Return (set | None) of pinned account IDs from the environment.
+
+    ``None`` -> variable unset (local/dev invocations). Caller should warn.
+    ``set``  -> enforce membership before issuing any sts:AssumeRole.
+    """
+    raw = os.environ.get(ALLOWED_TARGET_ACCOUNT_IDS_ENV)
+    if raw is None:
+        return None
+    allowed = set()
+    for token in re.split(r"[\s,;]+", raw.strip()):
+        if token and ACCOUNT_ID_PATTERN.match(token):
+            allowed.add(token)
+    return allowed
+
 # Regex for chars *not* allowed in IAM RoleSessionName (allowed: [\w+=,.@-]).
 _SESSION_NAME_INVALID_CHARS = re.compile(r"[^\w+=,.@-]")
 
@@ -124,6 +146,34 @@ def get_target_accounts(folder: str) -> set:
             "(TemplateValidation stage) to detect these earlier."
         )
         sys.exit(1)
+
+    # Enforce the pinned allowlist as a second, independent check so a bypass
+    # of TemplateValidation cannot cause an sts:AssumeRole against an
+    # unapproved account (and thus leak the shared ExternalId to a foreign
+    # CloudTrail). When the variable is unset we warn and continue, which
+    # keeps local invocations and unit tests working.
+    allowed = _get_allowed_target_accounts()
+    if allowed is None:
+        LOG.warning(
+            "%s is not set; proceeding without an account allowlist. "
+            "The pipeline buildspec MUST set this variable in production.",
+            ALLOWED_TARGET_ACCOUNT_IDS_ENV,
+        )
+    elif not allowed:
+        LOG.error(
+            "%s is set but contains no valid 12-digit account IDs; refusing to proceed.",
+            ALLOWED_TARGET_ACCOUNT_IDS_ENV,
+        )
+        sys.exit(1)
+    else:
+        unauthorized = sorted(accounts - allowed)
+        if unauthorized:
+            LOG.error(
+                "Target account(s) %s are not in the authoritative allowlist (%s). "
+                "Refusing to assume cross-account roles into unapproved accounts.",
+                unauthorized, ALLOWED_TARGET_ACCOUNT_IDS_ENV,
+            )
+            sys.exit(1)
 
     LOG.info("Target accounts discovered: %s", accounts)
     return accounts

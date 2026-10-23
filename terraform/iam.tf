@@ -80,7 +80,7 @@ resource "aws_iam_role_policy" "role_validation" {
       {
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
+        Resource = local.deploy_role_arns
       },
     ]
   })
@@ -110,7 +110,7 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
       {
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
+        Resource = local.deploy_role_arns
       },
     ]
   })

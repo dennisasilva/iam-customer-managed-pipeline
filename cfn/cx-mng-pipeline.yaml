@@ -112,6 +112,11 @@
         - 'false'
       Default: 'true'
 
+    AllowedTargetAccountIds:
+      Description: 'Comma-separated authoritative allowlist of 12-digit AWS account IDs the pipeline is permitted to deploy to. Enforced by validate_target_account_ids and role-validation; also narrows the sts:AssumeRole resource on the CodeBuild roles. Leave empty to preserve the legacy wildcard behavior (not recommended).'
+      Type: CommaDelimitedList
+      Default: ''
+
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
   ## +------------------------------------------------------+ ##
@@ -120,6 +125,12 @@
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
     cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
+    # cAllowedTargetAccountIdsSet is true when at least one 12-digit account
+    # ID was provided. When false, we fall back to the historical wildcard
+    # resource for sts:AssumeRole so existing stacks keep working after an
+    # in-place upgrade; the Python validation layer still emits a loud
+    # warning in that case.
+    cAllowedTargetAccountIdsSet: !Not [!Equals [!Join ["", !Ref AllowedTargetAccountIds], ""]]
 
   Resources:
 
@@ -182,6 +193,8 @@
               Value: America/Sao_Paulo
             - Name: REGION
               Value: !Sub ${AWS::Region}
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Join [",", !Ref AllowedTargetAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -223,6 +236,8 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Join [",", !Ref AllowedTargetAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -265,6 +280,8 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Join [",", !Ref AllowedTargetAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -306,6 +323,8 @@
               Value: America/Sao_Paulo
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Join [",", !Ref AllowedTargetAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -383,7 +402,22 @@
                 - Effect: Allow
                   Action:
                     - sts:AssumeRole
-                  Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # When AllowedTargetAccountIds is provided, restrict the
+                  # resource to that explicit set of ARNs so an sts:AssumeRole
+                  # into any other account is denied by IAM, even if the
+                  # application-layer validation is bypassed. Falls back to
+                  # the historical wildcard when no allowlist was supplied
+                  # (upgrade compatibility; application-layer warning fires).
+                  Resource: !If
+                    - cAllowedTargetAccountIdsSet
+                    - !Split
+                      - ","
+                      - !Sub
+                        - "arn:aws:iam::${inner}:role/deploy-customer-managed-policy"
+                        - inner: !Join
+                            - ":role/deploy-customer-managed-policy,arn:aws:iam::"
+                            - !Ref AllowedTargetAccountIds
+                    - "arn:aws:iam::*:role/deploy-customer-managed-policy"
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -501,7 +535,22 @@
                 - Effect: Allow
                   Action:
                     - sts:AssumeRole
-                  Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # When AllowedTargetAccountIds is provided, restrict the
+                  # resource to that explicit set of ARNs so an sts:AssumeRole
+                  # into any other account is denied by IAM, even if the
+                  # application-layer validation is bypassed. Falls back to
+                  # the historical wildcard when no allowlist was supplied
+                  # (upgrade compatibility; application-layer warning fires).
+                  Resource: !If
+                    - cAllowedTargetAccountIdsSet
+                    - !Split
+                      - ","
+                      - !Sub
+                        - "arn:aws:iam::${inner}:role/deploy-customer-managed-policy"
+                        - inner: !Join
+                            - ":role/deploy-customer-managed-policy,arn:aws:iam::"
+                            - !Ref AllowedTargetAccountIds
+                    - "arn:aws:iam::*:role/deploy-customer-managed-policy"
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##

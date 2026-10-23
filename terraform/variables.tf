@@ -64,6 +64,31 @@ variable "manual_approval" {
   default     = true
 }
 
+variable "allowed_target_account_ids" {
+  description = <<-EOT
+    Lista autoritativa de AWS account IDs (12 dígitos) em que a pipeline tem
+    permissão de deploy. Injetada como variável de ambiente ALLOWED_TARGET_ACCOUNT_IDS
+    nos projetos CodeBuild e usada para:
+      (1) rejeitar entradas Target que não estejam nesta lista nos scripts de
+          validation/deploy; e
+      (2) restringir sts:AssumeRole dos CodeBuild roles ao conjunto exato de
+          ARNs 'arn:aws:iam::<id>:role/deploy-customer-managed-policy'
+          (em vez do curinga 'arn:aws:iam::*:...').
+    Deve ser mantida FORA do repositório GitOps (atualizada só via Terraform/
+    pipeline infra), de modo que um commit no repo-alvo não possa expandir o
+    conjunto de contas que a pipeline pode acessar.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for a in var.allowed_target_account_ids : can(regex("^[0-9]{12}$", a))
+    ])
+    error_message = "Cada entrada em allowed_target_account_ids deve ser um AWS account ID de 12 dígitos."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Observação de escopo (paridade com o CloudFormation):
 #

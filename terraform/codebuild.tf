@@ -67,6 +67,14 @@ resource "aws_codebuild_project" "template_validation" {
       name  = "REGION"
       value = local.region
     }
+    environment_variable {
+      # Pinned allowlist of 12-digit account IDs. Validated inside the
+      # Python validation script to reject Target entries that are not
+      # in this set. Sourced from the Terraform input variable, which is
+      # managed outside the GitOps repository.
+      name  = "ALLOWED_TARGET_ACCOUNT_IDS"
+      value = local.allowed_target_account_ids_env
+    }
   }
 
   source {
@@ -94,6 +102,10 @@ resource "aws_codebuild_project" "role_validation" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "ALLOWED_TARGET_ACCOUNT_IDS"
+      value = local.allowed_target_account_ids_env
     }
   }
 
@@ -126,6 +138,10 @@ resource "aws_codebuild_project" "dry_run" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "ALLOWED_TARGET_ACCOUNT_IDS"
+      value = local.allowed_target_account_ids_env
     }
   }
 
@@ -162,6 +178,10 @@ resource "aws_codebuild_project" "customer_managed_policies" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "ALLOWED_TARGET_ACCOUNT_IDS"
+      value = local.allowed_target_account_ids_env
     }
   }
 

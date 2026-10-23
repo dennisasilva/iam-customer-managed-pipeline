@@ -12,7 +12,24 @@ locals {
   artifact_bucket_name = "${local.account_id}-${local.region}-cx-mng-artfcs"
 
   # ARN da role cross-account de deploy (criada nas contas-alvo).
-  deploy_role_arn = "arn:aws:iam::*:role/deploy-customer-managed-policy"
+  # Se allowed_target_account_ids for fornecida, restringimos a lista ao
+  # conjunto exato de ARNs para que, mesmo se a validação aplicacional for
+  # contornada, um sts:AssumeRole em uma conta fora da lista seja negado
+  # pelo IAM. Caso contrário mantemos o curinga para compatibilidade com
+  # instalações existentes (hardening gap documentado).
+  deploy_role_arns = length(var.allowed_target_account_ids) > 0 ? [
+    for a in var.allowed_target_account_ids :
+    "arn:aws:iam::${a}:role/deploy-customer-managed-policy"
+  ] : ["arn:aws:iam::*:role/deploy-customer-managed-policy"]
+
+  # Mantemos o atributo singular por compatibilidade com código que ainda o
+  # referencie; aponta para o primeiro elemento quando ele já é uma lista.
+  deploy_role_arn = local.deploy_role_arns[0]
+
+  # Valor serializado passado para o CodeBuild como ALLOWED_TARGET_ACCOUNT_IDS.
+  # String vazia quando a variável não foi configurada (os scripts emitem um
+  # warning nesse caso em vez de falhar, preservando compatibilidade).
+  allowed_target_account_ids_env = join(",", var.allowed_target_account_ids)
 
   # Seleciona a conexão CodeStar de acordo com o tipo de repositório.
   is_github      = var.repository_type == "GitHub"

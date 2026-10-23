@@ -71,6 +71,30 @@ BOTO3_CONFIG = Config(
 # locally or that stage is skipped, we re-validate before any STS call.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# See customer-managed-validation.py for the rationale. Re-enforced here so a
+# bypass of the TemplateValidation / RoleValidation stages cannot point the
+# deploy stage at an unapproved account.
+ALLOWED_TARGET_ACCOUNT_IDS_ENV = "ALLOWED_TARGET_ACCOUNT_IDS"
+
+
+def _get_allowed_target_accounts():
+    """Return (set | None) of pinned account IDs from the environment."""
+    raw = os.environ.get(ALLOWED_TARGET_ACCOUNT_IDS_ENV)
+    if raw is None:
+        return None
+    allowed = set()
+    for token in re.split(r"[\s,;]+", raw.strip()):
+        if token and ACCOUNT_ID_PATTERN.match(token):
+            allowed.add(token)
+    return allowed
+
+
+# Cached result of _get_allowed_target_accounts(). Populated on the first
+# call to _validate_account_id so we read the env var exactly once per run
+# and emit the "unset" warning at most once.
+_ALLOWED_TARGET_ACCOUNTS_CACHE: "tuple | None" = None  # (allowed_or_None,)
+_ALLOWED_WARNING_EMITTED = False
+
 
 # Default location of the JSON templates relative to this script's CWD. The
 # pipeline's buildspec runs the script from ``source/customer-managed-policies/``,
@@ -138,12 +162,43 @@ def _validate_account_id(account_id, context: str) -> None:
     ``context`` should describe where the value came from (e.g. assignment
     file + SID), so the error message points the operator at the offending
     JSON entry instead of just the value.
+
+    When ``ALLOWED_TARGET_ACCOUNT_IDS`` is set in the environment (populated
+    by the pipeline infrastructure from a protected location), the account
+    must also appear in that allowlist. This is a defense-in-depth check
+    against bypasses of the TemplateValidation stage.
     """
     if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id)):
         raise ValueError(
             f"Invalid Target account ID {account_id!r} in {context}. "
             f"Must be exactly 12 digits "
             f"(did the TemplateValidation stage run before this?)."
+        )
+
+    global _ALLOWED_TARGET_ACCOUNTS_CACHE, _ALLOWED_WARNING_EMITTED
+    if _ALLOWED_TARGET_ACCOUNTS_CACHE is None:
+        _ALLOWED_TARGET_ACCOUNTS_CACHE = (_get_allowed_target_accounts(),)
+    allowed = _ALLOWED_TARGET_ACCOUNTS_CACHE[0]
+
+    if allowed is None:
+        if not _ALLOWED_WARNING_EMITTED:
+            LOG.warning(
+                "%s is not set; proceeding without an account allowlist. "
+                "The pipeline buildspec MUST set this variable in production.",
+                ALLOWED_TARGET_ACCOUNT_IDS_ENV,
+            )
+            _ALLOWED_WARNING_EMITTED = True
+        return
+    if not allowed:
+        raise ValueError(
+            f"{ALLOWED_TARGET_ACCOUNT_IDS_ENV} is set but contains no valid "
+            f"12-digit account IDs; refusing to proceed with no permitted targets."
+        )
+    if account_id not in allowed:
+        raise ValueError(
+            f"Target account ID {account_id!r} in {context} is not in the "
+            f"authoritative allowlist ({ALLOWED_TARGET_ACCOUNT_IDS_ENV}). "
+            f"Refusing to assume cross-account role into an unapproved account."
         )
 
 
