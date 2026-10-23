@@ -86,14 +86,22 @@
       AllowedPattern: '^[A-Za-z0-9/_+=.@-]+$'
       ConstraintDescription: 'Secret name must contain only letters, numbers, and the characters / _ + = . @ -'
 
-    ExternalId:
-      Description: 'Shared secret used when assuming the cross-account deploy role. Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+    ExternalIdSecretId:
+      Description: >-
+        Name (or ARN) of the AWS Secrets Manager secret that stores the
+        cross-account ExternalId shared secret. The secret value - not this
+        name - must match the ExternalId parameter of
+        cx-mng-stackset-deploy-role.yaml exactly. CodeBuild resolves the value
+        at build time via a SECRETS_MANAGER-typed environment variable, so the
+        plaintext never enters the CodeBuild project definition,
+        BatchGetProjects output, or CloudFormation state. Generate the stored
+        value via "openssl rand -hex 32" or similar.
       Type: String
-      NoEcho: true
-      MinLength: 16
-      MaxLength: 64
-      AllowedPattern: '^[A-Za-z0-9_-]+$'
-      ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
+      Default: 'dev/cx-mgn-pipe/external-id'
+      MinLength: 1
+      MaxLength: 512
+      AllowedPattern: '^[A-Za-z0-9/_+=.@-]+$'
+      ConstraintDescription: 'Secret name must contain only letters, numbers, and the characters / _ + = . @ -'
 
     NamingConvention:
       Description: 'Prefix used in IAM role/CodeBuild names. Limited to 30 chars so role names fit the IAM 64-char limit (longest suffix is "-customer-managed-policies").'
@@ -221,8 +229,13 @@
               Value: !Sub ${AWS::Region}
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
+            # Resolved from Secrets Manager at build time; the project
+            # definition stores only the secret name. Returned as PLAINTEXT
+            # by codebuild:BatchGetProjects would leak the ExternalId, so
+            # Type: SECRETS_MANAGER is required.
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Ref ExternalIdSecretId
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -263,8 +276,13 @@
               Value: America/Sao_Paulo
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
+            # Resolved from Secrets Manager at build time; the project
+            # definition stores only the secret name. Returned as PLAINTEXT
+            # by codebuild:BatchGetProjects would leak the ExternalId, so
+            # Type: SECRETS_MANAGER is required.
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Ref ExternalIdSecretId
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -304,8 +322,13 @@
           EnvironmentVariables:
             - Name: TZ
               Value: America/Sao_Paulo
+            # Resolved from Secrets Manager at build time; the project
+            # definition stores only the secret name. Returned as PLAINTEXT
+            # by codebuild:BatchGetProjects would leak the ExternalId, so
+            # Type: SECRETS_MANAGER is required.
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Ref ExternalIdSecretId
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -384,6 +407,16 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                # Allow CodeBuild to resolve the EXTERNAL_ID SECRETS_MANAGER-
+                # typed environment variable at build time. Scoped to the
+                # single secret named by the ExternalIdSecretId parameter;
+                # the trailing "-*" matches the random 6-char suffix that
+                # Secrets Manager appends to secret ARNs.
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource:
+                    - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ExternalIdSecretId}-*'
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +535,16 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                # Allow CodeBuild to resolve the EXTERNAL_ID SECRETS_MANAGER-
+                # typed environment variable at build time. Scoped to the
+                # single secret named by the ExternalIdSecretId parameter;
+                # the trailing "-*" matches the random 6-char suffix that
+                # Secrets Manager appends to secret ARNs.
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource:
+                    - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ExternalIdSecretId}-*'
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##

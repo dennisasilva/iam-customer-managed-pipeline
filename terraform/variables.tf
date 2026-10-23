@@ -36,14 +36,21 @@ variable "branch_name" {
   default     = "main"
 }
 
-variable "external_id" {
-  description = "Shared secret usado em todo sts:AssumeRole cross-account. Deve ser IGUAL ao ExternalId da role de deploy nas contas-alvo. Gere via 'openssl rand -hex 32'."
+variable "external_id_secret_id" {
+  description = <<-EOT
+    Nome (ou ARN) do segredo em AWS Secrets Manager que armazena o shared
+    secret ExternalId usado nos sts:AssumeRole cross-account. O VALOR do
+    segredo (não este nome) deve ser IGUAL ao ExternalId da role de deploy
+    nas contas-alvo. O CodeBuild resolve o valor em tempo de build via uma
+    environment_variable do tipo SECRETS_MANAGER, de forma que o plaintext
+    nunca entra na definição do projeto nem no estado do Terraform.
+    Gere o valor armazenado via 'openssl rand -hex 32'.
+  EOT
   type        = string
-  sensitive   = true
 
   validation {
-    condition     = can(regex("^[A-Za-z0-9_-]{16,64}$", var.external_id))
-    error_message = "external_id deve ter 16-64 caracteres: alfanuméricos, hífen ou underscore."
+    condition     = can(regex("^[A-Za-z0-9/_+=.@-]+$", var.external_id_secret_id)) && length(var.external_id_secret_id) >= 1 && length(var.external_id_secret_id) <= 512
+    error_message = "external_id_secret_id deve conter apenas letras, números e os caracteres / _ + = . @ -, com 1 a 512 chars."
   }
 }
 

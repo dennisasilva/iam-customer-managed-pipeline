@@ -1,6 +1,13 @@
 # Copie para terraform.tfvars e ajuste os valores.
-# Gere o external_id com:  openssl rand -hex 32
-# Use o MESMO valor no módulo terraform/deploy-role (contas-alvo).
+#
+# ExternalId (shared secret cross-account):
+#   1) Gere o valor:        openssl rand -hex 32
+#   2) Guarde-o em AWS Secrets Manager, p.ex.:
+#        aws secretsmanager create-secret \
+#          --name dev/cx-mgn-pipe/external-id \
+#          --secret-string "<valor-gerado>"
+#   3) Use esse NOME (ou o ARN) em external_id_secret_id abaixo.
+# Use o MESMO VALOR do segredo no módulo terraform/deploy-role (contas-alvo).
 
 region            = "us-east-1"
 repository_type   = "GitHub"
@@ -10,4 +17,4 @@ branch_name       = "main"
 naming_convention = "cx-mng-pipeline"
 manual_approval   = true
 
-# external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"
+# external_id_secret_id = "dev/cx-mgn-pipe/external-id"

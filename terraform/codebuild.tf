@@ -91,9 +91,14 @@ resource "aws_codebuild_project" "role_validation" {
       name  = "TZ"
       value = "America/Sao_Paulo"
     }
+    # Resolved from Secrets Manager at build time; the project definition
+    # stores only the secret name. Returned as PLAINTEXT by
+    # codebuild:BatchGetProjects would leak the ExternalId, so
+    # type = "SECRETS_MANAGER" is required.
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = "SECRETS_MANAGER"
+      value = var.external_id_secret_id
     }
   }
 
@@ -123,9 +128,14 @@ resource "aws_codebuild_project" "dry_run" {
       name  = "STATE_BUCKET"
       value = aws_s3_bucket.artifacts.id
     }
+    # Resolved from Secrets Manager at build time; the project definition
+    # stores only the secret name. Returned as PLAINTEXT by
+    # codebuild:BatchGetProjects would leak the ExternalId, so
+    # type = "SECRETS_MANAGER" is required.
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = "SECRETS_MANAGER"
+      value = var.external_id_secret_id
     }
   }
 
@@ -159,9 +169,14 @@ resource "aws_codebuild_project" "customer_managed_policies" {
       name  = "STATE_BUCKET"
       value = aws_s3_bucket.artifacts.id
     }
+    # Resolved from Secrets Manager at build time; the project definition
+    # stores only the secret name. Returned as PLAINTEXT by
+    # codebuild:BatchGetProjects would leak the ExternalId, so
+    # type = "SECRETS_MANAGER" is required.
     environment_variable {
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      type  = "SECRETS_MANAGER"
+      value = var.external_id_secret_id
     }
   }
 

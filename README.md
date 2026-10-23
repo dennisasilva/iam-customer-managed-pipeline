@@ -199,17 +199,26 @@ Configure o Git para usar `main` como branch padrão:
 git config --global init.defaultBranch main
 ```
 
-### 6. Gerar `ExternalId` para cross-account
+### 6. Gerar `ExternalId` para cross-account e guardá-lo em Secrets Manager
 
-A pipeline usa `sts:ExternalId` como shared secret em toda chamada `AssumeRole` cross-account (proteção contra confused deputy). Gere um valor forte uma única vez e use o **mesmo valor** nos 2 stacks (pipeline + StackSet):
+A pipeline usa `sts:ExternalId` como shared secret em toda chamada `AssumeRole` cross-account (proteção contra confused deputy). O **valor** vive em AWS Secrets Manager; os stacks só referenciam o **nome** do segredo, de forma que o plaintext nunca entra na definição dos projetos CodeBuild (que seria exposta por `codebuild:BatchGetProjects`) nem no estado do CloudFormation/Terraform.
 
 ```bash
-# Gerar valor seguro (alfanumérico + hífen, 64 chars)
-openssl rand -hex 32
-# exemplo de saída: 7b3e5f2a1c8d4e9f0a6b3c5d7e9f2a1b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f
+# 1) Gerar valor seguro (alfanumérico + hífen, 64 chars)
+EXTERNAL_ID_VALUE=$(openssl rand -hex 32)
+
+# 2) Guardar o valor em Secrets Manager (uma única vez)
+aws secretsmanager create-secret \
+  --name dev/cx-mgn-pipe/external-id \
+  --description 'Shared ExternalId for cx-mng-pipeline cross-account AssumeRole' \
+  --secret-string "$EXTERNAL_ID_VALUE"
+
+# 3) Use o MESMO valor ($EXTERNAL_ID_VALUE) ao criar a role nas contas-alvo
+#    (o StackSet / terraform/deploy-role ainda recebe o valor em claro,
+#    pois trata-se do lado "servidor" da comparação sts:ExternalId).
 ```
 
-Guarde esse valor — você vai passá-lo como parâmetro `ExternalId` em **ambos** os comandos de deploy abaixo. Para rotação no futuro, atualize a pipeline primeiro com o novo valor, depois o StackSet (a ordem inversa bloqueia a pipeline).
+Para **rotacionar** no futuro: atualize o valor em Secrets Manager (`aws secretsmanager put-secret-value`) **primeiro**, depois propague o novo valor para o StackSet / `terraform/deploy-role`. O CodeBuild resolve o novo valor no próximo build sem precisar atualizar o stack da pipeline.
 
 ## Deploy da Pipeline
 
@@ -226,7 +235,7 @@ Todos os parâmetros têm validação de input (`AllowedPattern`, `MinLength`, `
 | `RepositoryOwner` | Username do owner do repositório GitHub | `dennisasilva` | regex GitHub username (max 39 chars) |
 | `BranchName` | Branch do repositório que a pipeline rastreia | `main` | regex git branch name (max 250 chars) |
 | `SecretId` | Nome do secret no Secrets Manager com o token GitHub | `dev/cx-mgn-pipe/github` | regex secret name + `NoEcho: true` |
-| `ExternalId` | Shared secret usado em todo `sts:AssumeRole` cross-account. Mesmo valor passado nos 2 stacks (pipeline + StackSet). | _(sem default — obrigatório)_ | 16-64 chars `[A-Za-z0-9_-]`, `NoEcho: true` |
+| `ExternalIdSecretId` | Nome (ou ARN) do secret no Secrets Manager que **guarda o valor** do shared secret `sts:ExternalId`. Resolvido pelo CodeBuild em tempo de build via `Type: SECRETS_MANAGER` — o plaintext nunca entra na definição do projeto. | `dev/cx-mgn-pipe/external-id` | regex secret name (1-512 chars) |
 | `NamingConvention` | Prefixo para nomes dos recursos | `cx-mng-pipeline` | lowercase, max 30 chars (limita IAM RoleName a 64 chars) |
 | `ManualApproval` | Habilitar stage de aprovação manual | `true` | `AllowedValues: ['true', 'false']` |
 
@@ -245,13 +254,13 @@ aws cloudformation deploy \
     RepositoryOwner=dennisasilva \
     BranchName=main \
     SecretId=dev/cx-mgn-pipe/github \
-    ExternalId=<EXTERNAL_ID_VALUE> \
+    ExternalIdSecretId=dev/cx-mgn-pipe/external-id \
     NamingConvention=cx-mng-pipeline \
     ManualApproval=true \
   --region us-east-1
 ```
 
-> **Importante:** Use o **mesmo `ExternalId`** que você passou no StackSet do passo 4 dos pré-requisitos.
+> **Importante:** o valor armazenado em `ExternalIdSecretId` deve ser **idêntico** ao `ExternalId` que você passou no StackSet do passo 4 dos pré-requisitos.
 
 > **Importante:** Após o deploy, acesse o console do CodeStar Connections e complete a conexão com o GitHub (status deve mudar de `PENDING` para `AVAILABLE`).
 
@@ -282,7 +291,8 @@ cd terraform
 
 # 1) Configurar variáveis
 cp terraform.tfvars.example terraform.tfvars
-# edite terraform.tfvars e defina o external_id (openssl rand -hex 32)
+# edite terraform.tfvars e defina external_id_secret_id
+# (nome do segredo em Secrets Manager - veja passo 6 dos pré-requisitos)
 
 # 2) Inicializar e revisar o plano
 terraform init
@@ -304,7 +314,7 @@ terraform apply \
 
 > Assim como no CloudFormation, após o `apply` a **CodeStar Connection** nasce `PENDING` — conclua o handshake no console (Developer Tools → Connections) para `AVAILABLE` antes do primeiro run.
 
-> **Estado do Terraform:** este módulo usa backend local por padrão. Para uso em equipe, configure um backend remoto (ex.: S3 + DynamoDB lock). Lembre-se de que `external_id` é sensível e fica registrado no state — proteja o backend adequadamente.
+> **Estado do Terraform:** este módulo usa backend local por padrão. Para uso em equipe, configure um backend remoto (ex.: S3 + DynamoDB lock). O `external_id_secret_id` é apenas o **nome** do segredo (não o valor), portanto o plaintext do ExternalId **não** aparece no state do Terraform; o valor em si vive em Secrets Manager. Ainda assim proteja o backend remoto adequadamente.
 
 ## Estrutura do Projeto
 
@@ -735,7 +745,7 @@ aws cloudformation deploy ... && \
 - **Princípio do menor privilégio em S3**: os 3 roles de CodeBuild (`role-validation`, `template-validation`, `customer-managed-policies`) e o `code-pipeline` role têm `s3:GetObject/PutObject/ListBucket` escopados a `${CxMgrartifactsBucket}` apenas — não podem tocar em qualquer bucket da conta.
 - **KMS escopado por serviço**: `kms:Decrypt`/`kms:GenerateDataKey` nos 4 roles têm `Condition: kms:ViaService = s3.${region}.amazonaws.com`, restringindo o uso da KMS key à interação com S3 daquela região.
 - **AssumeRole cross-account específico**: o `code-pipeline` role só pode `sts:AssumeRole` em `arn:aws:iam::*:role/deploy-customer-managed-policy`, não em roles arbitrários.
-- **`sts:ExternalId` exigido em todo cross-account**: a role `deploy-customer-managed-policy` em cada conta-alvo tem `Condition: sts:ExternalId: <valor>`. Mesmo se a conta da pipeline for comprometida, um atacante que detenha apenas o ARN da role precisa também conhecer o valor do `ExternalId` (NoEcho parameter, não exposto no console). Pipeline e StackSet usam o **mesmo valor** — passado via parâmetro NoEcho em ambos os stacks. Nos scripts, lido da env var `EXTERNAL_ID` (injetada pelos CodeBuild projects via `EnvironmentVariables`).
+- **`sts:ExternalId` exigido em todo cross-account**: a role `deploy-customer-managed-policy` em cada conta-alvo tem `Condition: sts:ExternalId: <valor>`. Mesmo se a conta da pipeline for comprometida, um atacante que detenha apenas o ARN da role precisa também conhecer o valor do `ExternalId`. **O valor não é embutido na pipeline**: ele vive em AWS Secrets Manager e os projetos CodeBuild o resolvem em tempo de build via uma environment variable do tipo `SECRETS_MANAGER` (parâmetro `ExternalIdSecretId` / `external_id_secret_id`). Assim, `codebuild:BatchGetProjects` e o console retornam apenas o **nome** do segredo, nunca o valor; o estado do CloudFormation/Terraform também guarda só o nome. Os roles `${NamingConvention}-role-validation` e `${NamingConvention}-customer-managed-policies` recebem `secretsmanager:GetSecretValue` escopado ao ARN desse segredo. Nos scripts, o valor é lido da env var `EXTERNAL_ID` (injetada pelos CodeBuild projects, ainda a partir do Secrets Manager).
 - **Ações IAM destrutivas restritas por tag**: na role cross-account `deploy-customer-managed-policy`, as ações `iam:DeletePolicy`, `iam:DeletePolicyVersion`, `iam:CreatePolicyVersion`, `iam:TagPolicy` e `iam:UntagPolicy` só são permitidas em policies que já carregam a tag `cx-mng:true` (`Condition: aws:ResourceTag/cx-mng=true`). Isso torna o **IAM** (não apenas o script de deploy) o ponto de enforcement: mesmo um script com bug ou adulterado não consegue deletar/modificar policies que a pipeline não criou. `iam:CreatePolicy` fica num statement separado sem a condition (a policy ainda não tem tag no momento de criar; o script aplica `cx-mng:true` logo em seguida).
 - **Sem dependências mortas**: nenhum dos roles tem `codecommit:GitPull` (a pipeline usa GitHub via CodeStar, não CodeCommit).
 

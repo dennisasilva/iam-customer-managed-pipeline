@@ -49,8 +49,16 @@ Resources:
                 # ExternalId acts as a shared secret. Even if the pipeline
                 # account is compromised, an attacker holding only the role
                 # ARN cannot assume this role without also knowing the
-                # ExternalId value (which lives in Secrets-Manager-backed
-                # NoEcho parameters on both stacks).
+                # ExternalId value. On the pipeline side the value is stored
+                # in AWS Secrets Manager and resolved into the CodeBuild
+                # projects at build time via a SECRETS_MANAGER-typed
+                # environment variable (see ExternalIdSecretId in
+                # cx-mng-pipeline.yaml / external_id_secret_id in
+                # terraform/variables.tf), so it never appears in plaintext
+                # in BatchGetProjects output or CloudFormation/Terraform
+                # state. On this stack it is still passed as a NoEcho
+                # parameter at deploy time; rotate it in Secrets Manager and
+                # update this stack together.
                 'sts:ExternalId': !Ref ExternalId
       Policies:
         - PolicyName: customer-managed-policy-management
