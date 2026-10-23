@@ -106,6 +106,18 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
         Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
+      {
+        # Required for the delete sweep in customer-managed-deploy.py: when an
+        # account is removed from every assignment, the pipeline must delete
+        # its state/<account>.json object so get_previously_managed_accounts()
+        # stops returning it on subsequent runs. Scoped to state/*; the bucket
+        # policy additionally denies writes/deletes on state/* from any
+        # principal that is not this role, so this is the only legitimate
+        # delete path.
+        Effect   = "Allow"
+        Action   = ["s3:DeleteObject"]
+        Resource = ["${local.bucket_arn}/state/*"]
+      },
       local.kms_via_s3_statement,
       {
         Effect   = "Allow"

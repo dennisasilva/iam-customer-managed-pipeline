@@ -502,6 +502,19 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                - Effect: Allow
+                  # Required for the delete sweep in customer-managed-deploy.py:
+                  # when an account is removed from every assignment, the
+                  # pipeline must delete its state/<account>.json object so
+                  # get_previously_managed_accounts() stops returning it on
+                  # subsequent runs. Scoped to the state/ prefix; the artifact
+                  # bucket policy additionally denies writes/deletes on state/*
+                  # from any principal that is not this role, so this grant is
+                  # the only legitimate delete path.
+                  Action:
+                    - s3:DeleteObject
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/state/*'
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##

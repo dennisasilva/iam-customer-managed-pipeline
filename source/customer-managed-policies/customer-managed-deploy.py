@@ -187,7 +187,13 @@ def load_state(s3_client, account_id: str, state_bucket: str) -> dict:
 
 
 def save_state(s3_client, account_id: str, state: dict, state_bucket: str) -> None:
-    """Persist ``state/<account_id>.json`` to S3, stamping ``last_execution`` in UTC."""
+    """Persist ``state/<account_id>.json`` to S3, stamping ``last_execution`` in UTC.
+
+    A failed write re-raises: the drift-detection fast path in phase 1 relies on
+    this state being an accurate reflection of IAM, so a silent drop would leave
+    IAM and the state store inconsistent (CWE-372). The caller is expected to
+    let the exception abort the stage so operators notice.
+    """
     if not state_bucket:
         return
     try:
@@ -202,8 +208,9 @@ def save_state(s3_client, account_id: str, state: dict, state_bucket: str) -> No
             "[%s] State saved to s3://%s/state/%s.json",
             account_id, state_bucket, account_id,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         LOG.error("[%s] Could not save state: %s", account_id, exc)
+        raise
 
 
 def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict) -> None:
@@ -533,17 +540,28 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
         if not args.dry_run and s3_client:
             state["account_id"] = account_id
             state["policies"] = policies_state
-            if policies_state:
-                save_state(s3_client, account_id, state, args.state_bucket)
-            elif account_id in removed_accounts:
-                # Account is gone from assignments and has no policies left — drop its state file.
+            if account_id in removed_accounts and not policies_state:
+                # Account is gone from assignments and has no policies left —
+                # drop its state file so get_previously_managed_accounts() stops
+                # returning it on every subsequent run. A failed delete must be
+                # a stage failure, not a swallowed warning: otherwise the state
+                # object survives forever and the next delete sweep tries to
+                # assume a role that no longer exists.
                 try:
                     s3_client.delete_object(
                         Bucket=args.state_bucket, Key=f"state/{account_id}.json"
                     )
                     LOG.info("[%s] State removed from S3.", account_id)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning("[%s] Could not remove state: %s", account_id, exc)
+                except Exception as exc:
+                    LOG.error("[%s] Could not remove state: %s", account_id, exc)
+                    raise
+            else:
+                # Always persist the pruned state for accounts still under
+                # management. An empty ``policies`` map is a valid, meaningful
+                # state: it tells phase 1 that nothing is tracked for this
+                # account, so a later re-declaration in Git is created fresh
+                # instead of being hidden by a stale hash (CWE-372).
+                save_state(s3_client, account_id, state, args.state_bucket)
 
 
 # --------------------------------------------------------------------------- #
