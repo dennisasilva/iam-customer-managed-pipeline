@@ -71,6 +71,11 @@ BOTO3_CONFIG = Config(
 # locally or that stage is skipped, we re-validate before any STS call.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# Shape of the cross-account ExternalId shared secret. Must match the
+# constraint applied by the pipeline's CloudFormation / Terraform input and
+# by the ``deploy-customer-managed-policy`` trust policy generator.
+EXTERNAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
 
 # Default location of the JSON templates relative to this script's CWD. The
 # pipeline's buildspec runs the script from ``source/customer-managed-policies/``,
@@ -257,28 +262,56 @@ def get_current_policy_doc(iam_client, policy_arn: str):
         return None
 
 
+def load_external_id() -> str:
+    """Return the cross-account ExternalId shared secret or abort the process.
+
+    Read exactly once at start-up from the ``EXTERNAL_ID`` environment
+    variable (in production, sourced from AWS Secrets Manager / SSM
+    SecureString via the CodeBuild ``EnvironmentVariables`` block of type
+    ``SECRETS_MANAGER`` or ``PARAMETER_STORE``).
+
+    Fails closed with ``SystemExit(1)`` when the value is missing, empty, or
+    does not match the documented ``^[A-Za-z0-9_-]{16,64}$`` shape, so the
+    deploy stage refuses to issue a single ``sts:assume_role`` call without
+    the second factor that protects the cross-account trust.
+    """
+    external_id = os.environ.get("EXTERNAL_ID")
+    if external_id is None or external_id == "":
+        LOG.error(
+            "EXTERNAL_ID environment variable is required but is unset or empty. "
+            "Refusing to call sts:AssumeRole without the cross-account ExternalId "
+            "shared secret. Source it from Secrets Manager / SSM SecureString via "
+            "the CodeBuild EnvironmentVariables block."
+        )
+        sys.exit(1)
+    if not EXTERNAL_ID_PATTERN.match(external_id):
+        LOG.error(
+            "EXTERNAL_ID does not match the required shape "
+            "'^[A-Za-z0-9_-]{16,64}$'. Refusing to call sts:AssumeRole with a "
+            "malformed ExternalId."
+        )
+        sys.exit(1)
+    return external_id
+
+
 def get_iam_client(account_id: str):
     """Return an IAM client running with credentials from ``deploy-customer-managed-policy``.
 
     Reads the ``EXTERNAL_ID`` environment variable to fulfill the
     ``sts:ExternalId`` condition on the cross-account role's
-    AssumeRolePolicyDocument. The variable is OPTIONAL — when absent (e.g. in
-    moto-based tests or local dev with a role that has no condition), the
-    ExternalId argument is omitted, and ``assume_role`` succeeds as long as
-    the principal+action match.
-
-    In production, the StackSet enforces ``sts:ExternalId``, so a missing
-    EXTERNAL_ID env var will surface as ``AccessDenied`` from STS — caught
-    upstream by the script's per-policy error handler.
+    AssumeRolePolicyDocument. The variable is MANDATORY: if it is unset,
+    empty, or does not match ``^[A-Za-z0-9_-]{16,64}$`` the process exits
+    with status 1 *before* any STS call is issued (see ``load_external_id``),
+    so the deploy stage cannot silently fall back to assuming the role
+    without the cross-account shared secret.
     """
+    external_id = load_external_id()
     sts = boto3.client("sts", config=BOTO3_CONFIG)
     assume_role_kwargs = {
         "RoleArn": f"arn:aws:iam::{account_id}:role/{ROLE_NAME}",
         "RoleSessionName": _build_session_name("CxMngDeploy"),
+        "ExternalId": external_id,
     }
-    external_id = os.environ.get("EXTERNAL_ID")
-    if external_id:
-        assume_role_kwargs["ExternalId"] = external_id
     assumed = sts.assume_role(**assume_role_kwargs)
     creds = assumed["Credentials"]
     return boto3.client(
@@ -554,6 +587,9 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 def main() -> int:
     """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
     args = parse_args()
+    # Fail fast, before any sts:AssumeRole call, if the required
+    # cross-account shared secret is unset, empty, or malformed.
+    load_external_id()
     create_update_customer_managed_policy(args)
     delete_customer_managed_policy(args)
     return 0

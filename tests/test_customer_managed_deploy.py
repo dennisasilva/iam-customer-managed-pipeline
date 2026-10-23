@@ -12,6 +12,17 @@ import pytest
 from moto import mock_aws
 
 
+# All tests in this file exercise code paths that assume_role via
+# ``get_iam_client``, which now (hard-)requires the EXTERNAL_ID env var to be
+# set to a value matching ``^[A-Za-z0-9_-]{16,64}$``. Provide a default so
+# unrelated tests continue to work. Individual tests override this via
+# ``monkeypatch.setenv`` / ``monkeypatch.delenv`` when they target the
+# EXTERNAL_ID enforcement behaviour itself.
+@pytest.fixture(autouse=True)
+def _default_external_id(monkeypatch):
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+
+
 # --------------------------------------------------------------------------- #
 # policy_hash
 # --------------------------------------------------------------------------- #
@@ -403,8 +414,9 @@ def _build_args(*, assignments_folder, policies_folder, dry_run=False, state_buc
 
 
 @mock_aws
-def test_get_iam_client_returns_working_iam_client(deploy_module, aws_credentials):
+def test_get_iam_client_returns_working_iam_client(deploy_module, aws_credentials, monkeypatch):
     """The helper assumes the cross-account role and returns a usable IAM client."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
     _create_deploy_role()
 
     iam = deploy_module.get_iam_client(DEFAULT_ACCOUNT)
@@ -790,8 +802,9 @@ def test_boto3_config_has_expected_timeouts_and_retries(deploy_module):
 
 
 @mock_aws
-def test_get_iam_client_applies_boto3_config(deploy_module, aws_credentials):
+def test_get_iam_client_applies_boto3_config(deploy_module, aws_credentials, monkeypatch):
     """The IAM client returned by get_iam_client carries our BOTO3_CONFIG."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
     _create_deploy_role()
     iam = deploy_module.get_iam_client(DEFAULT_ACCOUNT)
     assert iam.meta.config.connect_timeout == 10
@@ -846,37 +859,70 @@ def test_get_iam_client_passes_external_id_when_env_var_set(
     assert call_kwargs["RoleArn"] == "arn:aws:iam::123456789012:role/deploy-customer-managed-policy"
 
 
-def test_get_iam_client_omits_external_id_when_env_var_unset(
-    deploy_module, monkeypatch
-):
-    """When EXTERNAL_ID is absent, ExternalId is NOT passed (backward compat)."""
+def test_load_external_id_exits_when_env_var_unset(deploy_module, monkeypatch):
+    """EXTERNAL_ID is MANDATORY: unset → non-zero exit, no STS call."""
+    monkeypatch.delenv("EXTERNAL_ID", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        deploy_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_load_external_id_exits_when_env_var_empty(deploy_module, monkeypatch):
+    """EXTERNAL_ID is MANDATORY: empty string → non-zero exit, no STS call."""
+    monkeypatch.setenv("EXTERNAL_ID", "")
+
+    with pytest.raises(SystemExit) as excinfo:
+        deploy_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_load_external_id_exits_when_env_var_too_short(deploy_module, monkeypatch):
+    """EXTERNAL_ID must match ^[A-Za-z0-9_-]{16,64}$ — too short fails closed."""
+    monkeypatch.setenv("EXTERNAL_ID", "short")
+
+    with pytest.raises(SystemExit) as excinfo:
+        deploy_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_load_external_id_exits_when_env_var_has_bad_chars(deploy_module, monkeypatch):
+    """EXTERNAL_ID must match ^[A-Za-z0-9_-]{16,64}$ — disallowed chars fail closed."""
+    monkeypatch.setenv("EXTERNAL_ID", "has spaces and $pecial chars!!")
+
+    with pytest.raises(SystemExit) as excinfo:
+        deploy_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_get_iam_client_aborts_when_env_var_unset(deploy_module, monkeypatch):
+    """When EXTERNAL_ID is absent, get_iam_client exits before any STS call."""
     monkeypatch.delenv("EXTERNAL_ID", raising=False)
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
 
     with _patch_boto3_clients(deploy_module, sts_mock, iam_mock):
-        deploy_module.get_iam_client("123456789012")
+        with pytest.raises(SystemExit) as excinfo:
+            deploy_module.get_iam_client("123456789012")
 
-    sts_mock.assume_role.assert_called_once()
-    call_kwargs = sts_mock.assume_role.call_args.kwargs
-    assert "ExternalId" not in call_kwargs
+    assert excinfo.value.code == 1
+    sts_mock.assume_role.assert_not_called()
 
 
-def test_get_iam_client_omits_external_id_when_env_var_empty_string(
-    deploy_module, monkeypatch
-):
-    """An empty EXTERNAL_ID is treated as unset — avoids passing '' to AWS."""
+def test_get_iam_client_aborts_when_env_var_empty_string(deploy_module, monkeypatch):
+    """An empty EXTERNAL_ID is still a hard failure — no STS call issued."""
     monkeypatch.setenv("EXTERNAL_ID", "")
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
 
     with _patch_boto3_clients(deploy_module, sts_mock, iam_mock):
-        deploy_module.get_iam_client("123456789012")
+        with pytest.raises(SystemExit) as excinfo:
+            deploy_module.get_iam_client("123456789012")
 
-    call_kwargs = sts_mock.assume_role.call_args.kwargs
-    assert "ExternalId" not in call_kwargs
+    assert excinfo.value.code == 1
+    sts_mock.assume_role.assert_not_called()
 
 
 # --- end ExternalId behavior --- #

@@ -82,6 +82,13 @@ resource "aws_iam_role_policy" "role_validation" {
         Action   = "sts:AssumeRole"
         Resource = local.deploy_role_arn
       },
+      {
+        # Required so CodeBuild can resolve the SECRETS_MANAGER-typed
+        # EXTERNAL_ID environment variable from the dedicated secret.
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = aws_secretsmanager_secret.external_id.arn
+      },
     ]
   })
 }
@@ -111,6 +118,13 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
         Resource = local.deploy_role_arn
+      },
+      {
+        # Required so CodeBuild can resolve the SECRETS_MANAGER-typed
+        # EXTERNAL_ID environment variable from the dedicated secret.
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = aws_secretsmanager_secret.external_id.arn
       },
     ]
   })

@@ -89,9 +89,11 @@ def test_get_target_accounts_exits_on_account_id_with_whitespace(
 
 @mock_aws
 def test_check_role_exists_returns_true_when_role_present(
-    role_validation_module, aws_credentials
+    role_validation_module, aws_credentials, monkeypatch
 ):
-    """If the role exists and is assumable, the function returns True."""
+    """If the role exists, is assumable, and its trust policy carries the
+    sts:ExternalId condition, the function returns True."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
     iam = boto3.client("iam", region_name="us-east-1")
     iam.create_role(
         RoleName=role_validation_module.ROLE_NAME,
@@ -101,6 +103,11 @@ def test_check_role_exists_returns_true_when_role_present(
                 "Effect": "Allow",
                 "Principal": {"Service": "lambda.amazonaws.com"},
                 "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                        "sts:ExternalId": "test-external-id-1234567890",
+                    },
+                },
             }],
         }),
     )
@@ -111,9 +118,10 @@ def test_check_role_exists_returns_true_when_role_present(
 
 @mock_aws
 def test_check_role_exists_returns_false_when_role_missing(
-    role_validation_module, aws_credentials
+    role_validation_module, aws_credentials, monkeypatch
 ):
     """If the role does not exist, the function returns False (doesn't raise)."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
     # No role created → assume_role/get_role should fail and the function returns False.
     assert role_validation_module.check_role_exists("123456789012") is False
 
@@ -192,7 +200,24 @@ def test_check_role_exists_passes_external_id_when_env_var_set(
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
-    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.ROLE_NAME}}
+    iam_mock.get_role.return_value = {
+        "Role": {
+            "RoleName": role_validation_module.ROLE_NAME,
+            "AssumeRolePolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEquals": {
+                            "sts:ExternalId": "test-external-id-1234567890",
+                        },
+                    },
+                }],
+            },
+        },
+    }
 
     with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
         result = role_validation_module.check_role_exists("123456789012")
@@ -202,18 +227,142 @@ def test_check_role_exists_passes_external_id_when_env_var_set(
     assert call_kwargs.get("ExternalId") == "test-external-id-1234567890"
 
 
-def test_check_role_exists_omits_external_id_when_env_var_unset(
+def test_check_role_exists_fails_when_trust_policy_missing_external_id_condition(
     role_validation_module, monkeypatch
 ):
-    """When EXTERNAL_ID is absent, ExternalId is NOT passed (backward compat)."""
+    """A role whose trust policy does NOT carry sts:ExternalId fails the stage,
+    even if assume_role happened to succeed."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+
+    sts_mock = _make_sts_mock_returning_creds()
+    iam_mock = MagicMock()
+    iam_mock.get_role.return_value = {
+        "Role": {
+            "RoleName": role_validation_module.ROLE_NAME,
+            # No Condition at all → defense-in-depth check must fail closed.
+            "AssumeRolePolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+                    "Action": "sts:AssumeRole",
+                }],
+            },
+        },
+    }
+
+    with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
+        result = role_validation_module.check_role_exists("123456789012")
+
+    assert result is False
+
+
+def test_check_role_exists_fails_when_trust_policy_pins_wrong_external_id(
+    role_validation_module, monkeypatch
+):
+    """A role whose trust policy pins a DIFFERENT ExternalId value fails."""
+    monkeypatch.setenv("EXTERNAL_ID", "test-external-id-1234567890")
+
+    sts_mock = _make_sts_mock_returning_creds()
+    iam_mock = MagicMock()
+    iam_mock.get_role.return_value = {
+        "Role": {
+            "RoleName": role_validation_module.ROLE_NAME,
+            "AssumeRolePolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEquals": {
+                            "sts:ExternalId": "a-completely-different-value-XYZ",
+                        },
+                    },
+                }],
+            },
+        },
+    }
+
+    with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
+        result = role_validation_module.check_role_exists("123456789012")
+
+    assert result is False
+
+
+def test_load_external_id_exits_when_env_var_unset(
+    role_validation_module, monkeypatch
+):
+    """EXTERNAL_ID is MANDATORY: unset → non-zero exit, no STS call."""
+    monkeypatch.delenv("EXTERNAL_ID", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        role_validation_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_load_external_id_exits_when_env_var_empty(
+    role_validation_module, monkeypatch
+):
+    """EXTERNAL_ID is MANDATORY: empty string → non-zero exit, no STS call."""
+    monkeypatch.setenv("EXTERNAL_ID", "")
+
+    with pytest.raises(SystemExit) as excinfo:
+        role_validation_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_load_external_id_exits_when_env_var_too_short(
+    role_validation_module, monkeypatch
+):
+    """EXTERNAL_ID must match ^[A-Za-z0-9_-]{16,64}$ — too short fails closed."""
+    monkeypatch.setenv("EXTERNAL_ID", "short")
+
+    with pytest.raises(SystemExit) as excinfo:
+        role_validation_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_load_external_id_exits_when_env_var_has_bad_chars(
+    role_validation_module, monkeypatch
+):
+    """EXTERNAL_ID must match ^[A-Za-z0-9_-]{16,64}$ — disallowed chars fail closed."""
+    monkeypatch.setenv("EXTERNAL_ID", "has spaces and $pecial chars!!")
+
+    with pytest.raises(SystemExit) as excinfo:
+        role_validation_module.load_external_id()
+    assert excinfo.value.code == 1
+
+
+def test_check_role_exists_aborts_when_env_var_unset(
+    role_validation_module, monkeypatch
+):
+    """When EXTERNAL_ID is absent, check_role_exists exits before any STS call."""
     monkeypatch.delenv("EXTERNAL_ID", raising=False)
 
     sts_mock = _make_sts_mock_returning_creds()
     iam_mock = MagicMock()
-    iam_mock.get_role.return_value = {"Role": {"RoleName": role_validation_module.ROLE_NAME}}
 
     with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
-        role_validation_module.check_role_exists("123456789012")
+        with pytest.raises(SystemExit) as excinfo:
+            role_validation_module.check_role_exists("123456789012")
 
-    call_kwargs = sts_mock.assume_role.call_args.kwargs
-    assert "ExternalId" not in call_kwargs
+    assert excinfo.value.code == 1
+    sts_mock.assume_role.assert_not_called()
+
+
+def test_check_role_exists_aborts_when_env_var_empty(
+    role_validation_module, monkeypatch
+):
+    """An empty EXTERNAL_ID is still a hard failure — no STS call issued."""
+    monkeypatch.setenv("EXTERNAL_ID", "")
+
+    sts_mock = _make_sts_mock_returning_creds()
+    iam_mock = MagicMock()
+
+    with _patch_boto3_clients(role_validation_module, sts_mock, iam_mock):
+        with pytest.raises(SystemExit) as excinfo:
+            role_validation_module.check_role_exists("123456789012")
+
+    assert excinfo.value.code == 1
+    sts_mock.assume_role.assert_not_called()

@@ -141,6 +141,24 @@
         ConnectionName: !Sub ${AWS::StackName}-gitLab
         ProviderType: GitLab
 
+  ## +-------------------------------------------------------------------------+ ##
+  ## | Store the cross-account ExternalId as a Secrets Manager secret, so the  | ##
+  ## | CodeBuild projects can source it as a SECRETS_MANAGER-typed env var     | ##
+  ## | (never a plaintext EnvironmentVariable).                                | ##
+  ## +-------------------------------------------------------------------------+ ##
+
+    ExternalIdSecret:
+      Type: AWS::SecretsManager::Secret
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W77
+              reason: The secret is encrypted with the AWS-managed KMS key by default; dedicated CMK is optional and tracked separately.
+      Properties:
+        Name: !Sub "${NamingConvention}/external-id"
+        Description: 'Cross-account ExternalId shared secret used by the pipeline CodeBuild projects when assuming deploy-customer-managed-policy in member accounts.'
+        SecretString: !Ref ExternalId
+
   ## +----------------------------+ ##
   ## | Create a GitHub Repository | ##
   ## +----------------------------+ ##
@@ -222,7 +240,8 @@
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Sub "${ExternalIdSecret}"
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -264,7 +283,8 @@
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Sub "${ExternalIdSecret}"
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -305,7 +325,8 @@
             - Name: TZ
               Value: America/Sao_Paulo
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Type: SECRETS_MANAGER
+              Value: !Sub "${ExternalIdSecret}"
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -384,6 +405,12 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                - Effect: Allow
+                  # Required so CodeBuild can resolve the SECRETS_MANAGER-typed
+                  # EXTERNAL_ID environment variable from the dedicated secret.
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref ExternalIdSecret
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +529,12 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                - Effect: Allow
+                  # Required so CodeBuild can resolve the SECRETS_MANAGER-typed
+                  # EXTERNAL_ID environment variable from the dedicated secret.
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref ExternalIdSecret
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##
