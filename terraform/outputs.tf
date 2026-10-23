@@ -25,3 +25,13 @@ output "codebuild_projects" {
     aws_codebuild_project.customer_managed_policies.name,
   ]
 }
+
+output "approver_role_arn" {
+  description = "ARN da role que approvers devem assumir para aprovar o est\u00e1gio Approval. Vazio quando approver_principal_arns est\u00e1 vazio."
+  value       = try(aws_iam_role.approver[0].arn, "")
+}
+
+output "deny_self_approval_policy_arn" {
+  description = "ARN do managed policy que nega codepipeline:PutApprovalResult sobre esta pipeline. Anexe a todo principal que pode fazer push na branch rastreada."
+  value       = aws_iam_policy.deny_self_approval.arn
+}

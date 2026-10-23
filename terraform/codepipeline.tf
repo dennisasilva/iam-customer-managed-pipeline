@@ -79,21 +79,29 @@ resource "aws_codepipeline" "pipeline" {
     }
   }
 
-  # Estágio de aprovação manual — incluído apenas quando manual_approval = true.
-  dynamic "stage" {
-    for_each = var.manual_approval ? [1] : []
-    content {
-      name = "Approval"
-      action {
-        name     = "Approval"
-        category = "Approval"
-        owner    = "AWS"
-        provider = "Manual"
-        version  = "1"
-        configuration = {
-          CustomData = "Review DryRun logs and approve before deploying customer managed policies."
-        }
-      }
+  # Estágio de aprovação manual — agora SEMPRE presente (CWE-841).
+  # A variável manual_approval é mantida apenas por compatibilidade e sua
+  # validação rejeita o valor false. O ExternalEntityLink aponta para os
+  # logs do CodeBuild DryRun (código confiável), não para texto do commit.
+  # A permissão codepipeline:PutApprovalResult desta action está restrita à
+  # role aws_iam_role.approver (ver iam.tf) e explicitamente negada aos
+  # principals em source_push_principal_arns via
+  # aws_iam_policy.deny_self_approval.
+  stage {
+    name = "Approval"
+    action {
+      name     = "Approval"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+      configuration = merge(
+        {
+          CustomData         = "Review the DryRun build logs linked in ExternalEntityLink (produced by the trusted DryRun CodeBuild project) before approving. Approver MUST NOT be the same identity that pushed the commit."
+          ExternalEntityLink = "https://${var.region}.console.aws.amazon.com/codesuite/codebuild/projects/${aws_codebuild_project.dry_run.name}/history?region=${var.region}"
+        },
+        var.approval_notification_arn == "" ? {} : { NotificationArn = var.approval_notification_arn },
+      )
     }
   }
 

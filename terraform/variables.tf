@@ -59,9 +59,42 @@ variable "naming_convention" {
 }
 
 variable "manual_approval" {
-  description = "Habilita o estágio de aprovação manual antes do deploy das policies."
+  description = "Mantida por compatibilidade. O estágio de aprovação manual é OBRIGATÓRIO (CWE-841) e não pode ser desativado. Only `true` is accepted."
   type        = bool
   default     = true
+
+  validation {
+    condition     = var.manual_approval == true
+    error_message = "manual_approval cannot be disabled: the human gate before cross-account IAM deployment is mandatory."
+  }
+}
+
+variable "approver_principal_arns" {
+  description = "Lista de ARNs de IAM principals autorizados a aprovar o estágio Approval. São o único grupo com permissão codepipeline:PutApprovalResult sobre esta pipeline (separation of duties). Deixe vazio para somente criar o deny policy e provisionar o acesso de aprovação fora deste módulo."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for arn in var.approver_principal_arns : can(regex("^arn:aws[a-zA-Z-]*:iam::\\d{12}:(role|user|root)(/.*)?$", arn))])
+    error_message = "approver_principal_arns deve conter ARNs IAM válidos (role, user ou root)."
+  }
+}
+
+variable "source_push_principal_arns" {
+  description = "Lista informativa de IAM principals que podem fazer push na branch rastreada. O módulo não anexa políticas a esses principals (Terraform não deve possuir identidades pré-existentes), mas cria um managed deny policy que o operador DEVE anexar a cada um deles para impedir self-approval."
+  type        = list(string)
+  default     = []
+}
+
+variable "approval_notification_arn" {
+  description = "ARN do tópico SNS que recebe notificações de Approval. Quando definido, o Approval action publica a notificação out-of-band com o ExternalEntityLink para os logs do DryRun. Deixe vazio para desabilitar."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.approval_notification_arn == "" || can(regex("^arn:aws[a-zA-Z-]*:sns:[a-z0-9-]+:\\d{12}:[A-Za-z0-9_-]+$", var.approval_notification_arn))
+    error_message = "approval_notification_arn deve ser vazio ou um ARN SNS válido."
+  }
 }
 
 # ---------------------------------------------------------------------------

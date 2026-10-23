@@ -8,6 +8,13 @@ repository_owner  = "dennisasilva"
 repository_name   = "iam-cx-mng-pipeline"
 branch_name       = "main"
 naming_convention = "cx-mng-pipeline"
-manual_approval   = true
+manual_approval   = true  # mandatory; variable retained for compat, value must be true
+
+# Separation-of-duties controls (CWE-841). Approvers assume this role to
+# call codepipeline:PutApprovalResult; committers to the source branch
+# must be attached to the deny_self_approval_policy output.
+# approver_principal_arns     = ["arn:aws:iam::<acct>:role/MyApproverRole"]
+# source_push_principal_arns  = ["arn:aws:iam::<acct>:role/MyDeveloperRole"]
+# approval_notification_arn   = "arn:aws:sns:us-east-1:<acct>:cx-mng-approvals"
 
 # external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"

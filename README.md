@@ -228,7 +228,10 @@ Todos os parâmetros têm validação de input (`AllowedPattern`, `MinLength`, `
 | `SecretId` | Nome do secret no Secrets Manager com o token GitHub | `dev/cx-mgn-pipe/github` | regex secret name + `NoEcho: true` |
 | `ExternalId` | Shared secret usado em todo `sts:AssumeRole` cross-account. Mesmo valor passado nos 2 stacks (pipeline + StackSet). | _(sem default — obrigatório)_ | 16-64 chars `[A-Za-z0-9_-]`, `NoEcho: true` |
 | `NamingConvention` | Prefixo para nomes dos recursos | `cx-mng-pipeline` | lowercase, max 30 chars (limita IAM RoleName a 64 chars) |
-| `ManualApproval` | Habilitar stage de aprovação manual | `true` | `AllowedValues: ['true', 'false']` |
+| `ManualApproval` | (Compat) O estágio de aprovação manual é **obrigatório** (CWE-841). | `true` | `AllowedValues: ['true']` |
+| `ApproverPrincipalArns` | ARNs dos principals autorizados a aprovar (`PutApprovalResult`). | _vazio_ | lista separada por vírgulas |
+| `SourcePushPrincipalArns` | ARNs dos principals com push na branch rastreada (anexe-lhes o deny policy criado). | _vazio_ | lista separada por vírgulas |
+| `ApprovalNotificationArn` | Tópico SNS para notificações de Approval (out-of-band). | _vazio_ | ARN SNS |
 
 ### Comando de deploy
 
@@ -383,8 +386,8 @@ Roda `customer-managed-deploy.py --dry-run`:
 - Detecta drift (alterações manuais em policies gerenciadas pela pipeline)
 - **Não faz nenhuma mutação** — apenas reporta o que faria
 
-### 5. Approval (opcional)
-Stage de aprovação manual. O operador revisa os logs do DryRun no CodeBuild e aprova ou rejeita. Controlado pelo parâmetro `ManualApproval`.
+### 5. Approval (obrigatório)
+Stage de aprovação manual **sempre presente** (CWE-841 / separation of duties). O approver deve assumir a role `${NamingConvention}-approver` (criada quando `ApproverPrincipalArns` é fornecido) e revisar os logs do DryRun pelo `ExternalEntityLink` publicado na action — esses logs são produzidos pelo CodeBuild DryRun, código confiável, não pelo commit em revisão. O approver **não pode** ser o mesmo principal que fez o push: anexe o managed policy `${NamingConvention}-deny-self-approval` a todo principal listado em `SourcePushPrincipalArns`. Se `ApprovalNotificationArn` for um tópico SNS, cada entrada no gate é publicada out-of-band com o link do build.
 
 ### 6. CustomerManagedPolicies
 Roda `customer-managed-deploy.py` (sem `--dry-run`):

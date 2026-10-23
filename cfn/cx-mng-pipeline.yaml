@@ -105,12 +105,50 @@
       ConstraintDescription: 'Must be lowercase, start with a letter, end with a letter or number, contain only letters/numbers/hyphens (2-30 chars).'
 
     ManualApproval:
-      Description: 'Enable manual approval stage before deploying customer managed policies'
+      Description: >-
+        Manual approval stage is mandatory before deploying customer managed
+        policies. This parameter is retained for backward compatibility with
+        existing stacks but is now restricted to 'true' only: the gate cannot
+        be disabled at deploy time (CWE-841 / separation of duties).
       Type: String
       AllowedValues:
         - 'true'
-        - 'false'
       Default: 'true'
+
+    ApproverPrincipalArns:
+      Description: >-
+        Comma-separated list of IAM principal ARNs (users, roles, or role
+        session wildcards such as 'arn:aws:iam::<acct>:role/MyApprover') that
+        are allowed to approve the pipeline Approval action. These principals
+        receive a dedicated IAM policy granting codepipeline:PutApprovalResult
+        scoped to this pipeline's Approval action. Leave empty to skip the
+        auto-provisioned policy (approvers must then be granted the permission
+        out of band, but the Approval stage is still mandatory).
+      Type: CommaDelimitedList
+      Default: ''
+
+    SourcePushPrincipalArns:
+      Description: >-
+        (Informational) Comma-separated list of IAM principal ARNs that can
+        push to the tracked source branch. The template does not attach
+        policies to these ARNs directly (CloudFormation cannot own
+        pre-existing identities safely), but it creates a managed deny
+        policy (SourcePushDenySelfApprovalPolicy) that an operator MUST
+        attach to each of these principals to enforce separation of duties.
+      Type: CommaDelimitedList
+      Default: ''
+
+    ApprovalNotificationArn:
+      Description: >-
+        Optional SNS topic ARN that receives Approval notifications. When set,
+        the Approval action publishes an out-of-band notification containing
+        the pipeline execution and the ExternalEntityLink to the DryRun build
+        logs so reviewers can inspect a machine-generated diff rather than the
+        CustomData text produced by the submitted commit.
+      Type: String
+      Default: ''
+      AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:sns:[a-z0-9-]+:\d{12}:[A-Za-z0-9_-]+$'
+      ConstraintDescription: 'Must be empty or a valid SNS topic ARN.'
 
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
@@ -119,7 +157,8 @@
   Conditions:
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
-    cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
+    HasApproverPrincipals: !Not [ !Equals [ !Join [ '', !Ref ApproverPrincipalArns ], '' ] ]
+    HasApprovalNotificationArn: !Not [ !Equals [ !Ref ApprovalNotificationArn, '' ] ]
 
   Resources:
 
@@ -575,6 +614,77 @@
                     StringEquals:
                       'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
 
+  ## +------------------------------------------------------------------+ ##
+  ## | Approver role + separation-of-duties policies for the Approval   | ##
+  ## | stage. Enforces CWE-841 mitigation: PutApprovalResult is bound   | ##
+  ## | to a distinct identity, and committers to the source branch are | ##
+  ## | explicitly denied self-approval.                                | ##
+  ## +------------------------------------------------------------------+ ##
+
+    ApproverRole:
+      Type: AWS::IAM::Role
+      Condition: HasApproverPrincipals
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W28
+              reason: Explicit role name required so it can be referenced by approvers out of band.
+      Properties:
+        RoleName: !Sub "${NamingConvention}-approver"
+        Description: >-
+          Role assumed by human approvers to call
+          codepipeline:PutApprovalResult on this pipeline's Approval action.
+          Trust is restricted to the principals supplied via
+          ApproverPrincipalArns.
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS: !Ref ApproverPrincipalArns
+              Action: sts:AssumeRole
+              Condition:
+                Bool:
+                  'aws:MultiFactorAuthPresent': 'true'
+        Policies:
+          - PolicyName: ApprovePipelineAction
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: ApprovePipelineAction
+                  Effect: Allow
+                  Action:
+                    - codepipeline:PutApprovalResult
+                    - codepipeline:GetPipelineState
+                    - codepipeline:GetPipelineExecution
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${NamingConvention}-pipeline/Approval/Approval"
+                    - !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${NamingConvention}-pipeline"
+
+    # Deny policy that MUST be attached to any principal (role/user/group)
+    # able to push to the source branch. Enforces separation of duties: a
+    # committer cannot self-approve their own change even if they also hold
+    # a broad codepipeline:* grant. Attach via
+    # `aws iam attach-role-policy --policy-arn <this policy ARN> ...` for
+    # each principal listed in the SourcePushPrincipalArns stack parameter.
+    SourcePushDenySelfApprovalPolicy:
+      Type: AWS::IAM::ManagedPolicy
+      Properties:
+        ManagedPolicyName: !Sub "${NamingConvention}-deny-self-approval"
+        Description: >-
+          Explicit deny of codepipeline:PutApprovalResult on this pipeline's
+          Approval action. Attach to every principal that can push to the
+          tracked source branch.
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: DenySelfApproval
+              Effect: Deny
+              Action:
+                - codepipeline:PutApprovalResult
+              Resource:
+                - !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${NamingConvention}-pipeline/Approval/Approval"
+
   ## +--------------------+ ##
   ## | S3 Bucket Artifact | ##
   ## +--------------------+ ##
@@ -794,19 +904,26 @@
                 OutputArtifacts:
                   - Name: DryRunOutput
 
-          - !If
-            - cManualApproval
-            - Name: Approval
-              Actions:
-                - Name: Approval
-                  ActionTypeId:
-                    Category: Approval
-                    Owner: AWS
-                    Version: '1'
-                    Provider: Manual
-                  Configuration:
-                    CustomData: "Review DryRun logs and approve before deploying customer managed policies."
-            - !Ref AWS::NoValue
+          # Mandatory human gate. Previously conditional on `ManualApproval`;
+          # the gate is now always present (CWE-841). Approvers should review
+          # the DryRun build logs linked via ExternalEntityLink, which are
+          # produced by the trusted CodeBuild project (not the submitted
+          # commit text). PutApprovalResult on this action is restricted to
+          # the principals in ApproverPrincipalArns via the ApproverPolicy
+          # resource below, and explicitly denied to SourcePushPrincipalArns
+          # to enforce separation of duties from the git committer.
+          - Name: Approval
+            Actions:
+              - Name: Approval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Version: '1'
+                  Provider: Manual
+                Configuration:
+                  CustomData: "Review the DryRun build logs linked in ExternalEntityLink (produced by the trusted DryRun CodeBuild project) before approving. Approver MUST NOT be the same identity that pushed the commit."
+                  ExternalEntityLink: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/projects/${DryRunCodeBuildProject}/history?region=${AWS::Region}"
+                  NotificationArn: !If [ HasApprovalNotificationArn, !Ref ApprovalNotificationArn, !Ref 'AWS::NoValue' ]
 
           - Name: CustomerManagedPolicies
             Actions:

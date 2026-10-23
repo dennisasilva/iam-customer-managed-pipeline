@@ -163,3 +163,76 @@ resource "aws_iam_role_policy" "code_pipeline" {
     ]
   })
 }
+
+# ---------- Approver role (separation of duties, CWE-841) ----------
+# Role assumed by human approvers to call codepipeline:PutApprovalResult on
+# this pipeline's Approval action. Trust is restricted to the principals in
+# var.approver_principal_arns and additionally requires MFA on the caller.
+# Only created when the operator supplies approvers; if the list is empty,
+# the Approval stage is still mandatory and the operator provisions the
+# permission out of band.
+locals {
+  pipeline_arn          = "arn:${data.aws_partition.current.partition}:codepipeline:${local.region}:${local.account_id}:${aws_codepipeline.pipeline.name}"
+  approval_action_arn   = "${local.pipeline_arn}/Approval/Approval"
+  create_approver_role  = length(var.approver_principal_arns) > 0
+}
+
+resource "aws_iam_role" "approver" {
+  count       = local.create_approver_role ? 1 : 0
+  name        = "${var.naming_convention}-approver"
+  description = "Role that human approvers assume to approve the pipeline Approval action (separation of duties)."
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = var.approver_principal_arns }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        Bool = { "aws:MultiFactorAuthPresent" = "true" }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "approver" {
+  count = local.create_approver_role ? 1 : 0
+  name  = "ApprovePipelineAction"
+  role  = aws_iam_role.approver[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ApprovePipelineAction"
+      Effect = "Allow"
+      Action = [
+        "codepipeline:PutApprovalResult",
+        "codepipeline:GetPipelineState",
+        "codepipeline:GetPipelineExecution",
+      ]
+      Resource = [
+        local.approval_action_arn,
+        local.pipeline_arn,
+      ]
+    }]
+  })
+}
+
+# ---------- Deny-self-approval managed policy ----------
+# Managed deny policy an operator attaches to every principal that can push
+# to the tracked source branch. The attachment itself is intentionally left
+# to the operator (Terraform must not own pre-existing identities): the
+# policy ARN is exposed via outputs.tf so it can be referenced by other
+# modules or by `aws iam attach-role-policy`.
+resource "aws_iam_policy" "deny_self_approval" {
+  name        = "${var.naming_convention}-deny-self-approval"
+  description = "Deny codepipeline:PutApprovalResult on this pipeline's Approval action. Attach to every principal that can push to the source branch."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "DenySelfApproval"
+      Effect   = "Deny"
+      Action   = ["codepipeline:PutApprovalResult"]
+      Resource = [local.approval_action_arn]
+    }]
+  })
+}
