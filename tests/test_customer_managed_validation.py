@@ -331,3 +331,174 @@ def test_real_templates_have_unique_policy_names(validation_module, project_root
 
     assert policies, "No policy templates were found in templates/customer-managed-policies/"
     validation_module.validate_unique_policy_name(policies)
+
+
+# --------------------------------------------------------------------------- #
+# validate_policy_documents  — privilege-escalation denylist
+# --------------------------------------------------------------------------- #
+
+
+def _wrap(statement):
+    """Build the {filename: policy_file_dict} shape the validator expects."""
+    return {
+        "p.json": {
+            "PolicyName": "P",
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [statement],
+            },
+        }
+    }
+
+
+def test_validate_policy_documents_accepts_scoped_wildcards(validation_module):
+    """Scoped service wildcards (e.g. ec2:*SecurityGroup*) on Resource:* are OK."""
+    validation_module.validate_policy_documents(_wrap(
+        {"Sid": "ok", "Effect": "Allow", "Action": ["ec2:*SecurityGroup*"], "Resource": "*"}
+    ))
+    validation_module.validate_policy_documents(_wrap(
+        {"Sid": "ok", "Effect": "Allow", "Action": ["fis:*"], "Resource": "*"}
+    ))
+    validation_module.validate_policy_documents(_wrap(
+        {"Sid": "ok", "Effect": "Allow", "Action": ["airflow:*"], "Resource": "*"}
+    ))
+
+
+def test_validate_policy_documents_allows_scalar_action(validation_module):
+    """Action/Resource may be a scalar string, not just a list."""
+    validation_module.validate_policy_documents(_wrap(
+        {"Sid": "ok", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+    ))
+
+
+def test_validate_policy_documents_ignores_deny_statements(validation_module):
+    """Deny statements that use broad patterns are legitimate (deny-all idioms)."""
+    validation_module.validate_policy_documents(_wrap(
+        {"Sid": "deny", "Effect": "Deny", "NotAction": ["s3:*"], "Resource": "*"}
+    ))
+    validation_module.validate_policy_documents(_wrap(
+        {"Sid": "deny", "Effect": "Deny", "Action": "*", "Resource": "*"}
+    ))
+
+
+def test_validate_policy_documents_rejects_full_wildcard_action(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": "*", "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_iam_star(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": ["iam:*"], "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_sts_assume_role(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": ["sts:AssumeRole"], "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_iam_passrole(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {
+                "Sid": "bad", "Effect": "Allow",
+                "Action": ["iam:PassRole"],
+                "Resource": "arn:aws:iam::111111111111:role/foo",
+            }
+        ))
+
+
+def test_validate_policy_documents_rejects_iam_attach_role_policy(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": ["iam:AttachRolePolicy"], "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_not_action_in_allow(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "NotAction": ["s3:DeleteBucket"], "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_not_resource_in_allow(validation_module):
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": ["s3:*"], "NotResource": ["*"]}
+        ))
+
+
+def test_validate_policy_documents_rejects_sensitive_svc_with_star_resource(validation_module):
+    """Sensitive service action + Resource:* is rejected even if action is specific."""
+    with pytest.raises(ValueError, match="privilege-escalation"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": ["kms:Decrypt"], "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_malformed_action(validation_module):
+    with pytest.raises(ValueError, match="malformed"):
+        validation_module.validate_policy_documents(_wrap(
+            {"Sid": "bad", "Effect": "Allow", "Action": ["not-an-action"], "Resource": "*"}
+        ))
+
+
+def test_validate_policy_documents_rejects_missing_policy_document(validation_module):
+    with pytest.raises(ValueError, match="PolicyDocument"):
+        validation_module.validate_policy_documents({"p.json": {"PolicyName": "P"}})
+
+
+def test_validate_policy_documents_rejects_empty_statement(validation_module):
+    with pytest.raises(ValueError, match="Statement is empty"):
+        validation_module.validate_policy_documents({
+            "p.json": {
+                "PolicyName": "P",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": []},
+            }
+        })
+
+
+def test_validate_policy_documents_aggregates_errors(validation_module, caplog):
+    """Every bad statement across every file is reported in one raise."""
+    import logging
+    caplog.set_level(logging.ERROR)
+
+    policies = {
+        "ok.json": {
+            "PolicyName": "Ok",
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{"Sid": "ok", "Effect": "Allow", "Action": ["ec2:Describe*"], "Resource": "*"}],
+            },
+        },
+        "bad.json": {
+            "PolicyName": "Bad",
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Sid": "IamStar", "Effect": "Allow", "Action": ["iam:*"], "Resource": "*"},
+                    {"Sid": "KmsStar", "Effect": "Allow", "Action": ["kms:Decrypt"], "Resource": "*"},
+                ],
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="Rejected 2 privilege-escalation"):
+        validation_module.validate_policy_documents(policies)
+
+    assert "IamStar" in caplog.text
+    assert "KmsStar" in caplog.text
+    assert "ok" not in caplog.text or "bad.json" in caplog.text  # ok-tagged content not flagged
+
+
+def test_real_templates_pass_privilege_escalation_denylist(validation_module, project_root):
+    """Smoke test: shipped templates must pass the content denylist."""
+    folder = project_root / "templates" / "customer-managed-policies"
+    policies = validation_module.load_policy_files(str(folder))
+    validation_module.validate_policy_documents(policies)
+

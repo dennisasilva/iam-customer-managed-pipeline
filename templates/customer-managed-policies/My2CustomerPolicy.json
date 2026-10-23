@@ -4,14 +4,15 @@
   "Path": "/",
   "PolicyDocument": {
         "Version": "2012-10-17",
-        "Statement": [     
+        "Statement": [
             {
                 "Sid": "2ndPolicy",
                 "Action": [
-                    "s3:*",
-                    "ec2:*",
-                    "iam:*",
-                    "cloudfront:*"
+                    "s3:GetObject",
+                    "s3:ListBucket",
+                    "ec2:Describe*",
+                    "cloudfront:Get*",
+                    "cloudfront:List*"
                 ],
               "Effect": "Allow",
               "Resource": "*"

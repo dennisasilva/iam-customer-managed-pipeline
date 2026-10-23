@@ -35,6 +35,7 @@ Arguments:
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -52,6 +53,30 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOG = logging.getLogger(__name__)
+
+
+# Load the sibling TemplateValidation module so the deploy stage can re-run
+# the privilege-escalation denylist as defense in depth. The validation file
+# is a script path (hyphenated filename, not a valid import identifier) so we
+# load it with importlib and keep a module-level reference.
+_VALIDATION_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "validation",
+    "customer-managed-validation.py",
+)
+_spec = importlib.util.spec_from_file_location(
+    "customer_managed_validation", _VALIDATION_PATH
+)
+customer_managed_validation = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(customer_managed_validation)
+except Exception as _exc:  # noqa: BLE001 - fail loudly if the validator is missing
+    LOG.error(
+        "Could not load TemplateValidation module from %s: %s",
+        _VALIDATION_PATH, _exc,
+    )
+    raise
 
 
 # botocore client config used everywhere in this script:
@@ -338,6 +363,21 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                         continue
 
                     policy_document = policy_data["PolicyDocument"]
+                    # Defense-in-depth: re-run the privilege-escalation denylist
+                    # even if TemplateValidation already ran. Any violation here
+                    # means the policy document is unsafe to materialize in a
+                    # target account; skip this policy and continue with the
+                    # rest of the deploy (per-policy failure, not run-fatal).
+                    try:
+                        customer_managed_validation.validate_policy_documents(
+                            {policy_file: policy_data}
+                        )
+                    except ValueError as policy_exc:
+                        LOG.error(
+                            "%s[%s] REFUSED to deploy '%s': %s",
+                            log_prefix, account_id, policy_name, policy_exc,
+                        )
+                        continue
                     repo_hash = policy_hash(policy_document)
                     policy_tags = filter_tags(policy_data.get("Tags", []))
                     path = policy_data.get("Path", "/")

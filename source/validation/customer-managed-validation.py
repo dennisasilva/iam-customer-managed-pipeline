@@ -17,10 +17,16 @@
 
 """IAM customer-managed policy template validation.
 
-Runs as part of the pipeline ``TemplateValidation`` stage. Currently performs:
+Runs as part of the pipeline ``TemplateValidation`` stage. Performs:
 
 * JSON syntax validation of every ``*.json`` file in the policies folder.
 * Uniqueness check on the ``PolicyName`` field across all policy templates.
+* ``Path`` field well-formedness.
+* ``Target`` 12-digit account-ID well-formedness for assignment JSONs.
+* Policy-document privilege-escalation denylist (``iam:*``, ``Action: "*"``,
+  ``NotAction``/``NotResource`` in Allow, sensitive-service wildcards on
+  ``Resource: "*"``, and known PassRole/AssumeRole/Attach* escalation actions).
+  The deploy stage re-runs this same check as defense in depth.
 
 Arguments:
     --policies-folder:    Folder containing customer-managed policy JSON files.
@@ -54,6 +60,234 @@ POLICY_PATH_MAX_LENGTH = 512
 # whitespace, formatted numbers from spreadsheets, missing leading zeros) leads
 # to confusing AccessDenied errors at runtime when assume_role fails.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+
+
+# --------------------------------------------------------------------------- #
+# Policy-document denylist
+# --------------------------------------------------------------------------- #
+#
+# These checks run before any IAM mutation. They are intentionally narrow: the
+# pipeline exists to deploy declarative policy JSON, so we only reject patterns
+# that are indistinguishable from an attacker trying to mint account-takeover
+# primitives via a repository commit (CWE-267). Legitimate scoped-wildcard
+# patterns such as ``ec2:*SecurityGroup*`` or ``fis:*`` on ``Resource: "*"``
+# are intentionally allowed; only *fully* wildcard IAM/STS/Organizations etc.
+# or explicit privilege-escalation action names are rejected.
+#
+# Service prefixes that must never be combined with ``Resource: "*"`` because
+# they control identities, auth, keys, logging, or guardrails. Scoping these
+# to a concrete ARN is the whole point of a customer-managed policy.
+SENSITIVE_WILDCARD_RESOURCE_SERVICES = frozenset({
+    "iam",
+    "sts",
+    "organizations",
+    "account",
+    "kms",
+    "secretsmanager",
+    "ssm",
+    "cloudtrail",
+    "config",
+    "guardduty",
+    "securityhub",
+    "accessanalyzer",
+    "identitystore",
+    "sso",
+    "sso-directory",
+})
+
+# Individual IAM/STS actions that are, on their own, a privilege-escalation
+# primitive (either direct admin takeover or a well-known chain). An attacker
+# who can land a managed policy carrying any of these on an unconstrained
+# resource essentially owns every role in the target account the moment the
+# policy is attached to a principal they influence.
+PRIVILEGE_ESCALATION_ACTIONS = frozenset({
+    "iam:*",
+    "iam:attachrolepolicy",
+    "iam:attachuserpolicy",
+    "iam:attachgrouppolicy",
+    "iam:putrolepolicy",
+    "iam:putuserpolicy",
+    "iam:putgrouppolicy",
+    "iam:createpolicy",
+    "iam:createpolicyversion",
+    "iam:setdefaultpolicyversion",
+    "iam:createrole",
+    "iam:createuser",
+    "iam:createaccesskey",
+    "iam:createloginprofile",
+    "iam:updateloginprofile",
+    "iam:updateassumerolepolicy",
+    "iam:passrole",
+    "iam:addusertogroup",
+    "iam:createservicelinkedrole",
+    "sts:*",
+    "sts:assumerole",
+    "sts:assumerolewithsaml",
+    "sts:assumerolewithwebidentity",
+})
+
+
+def _as_list(value) -> list:
+    """Return ``value`` as a list. Accepts ``None``, scalar, or list.
+
+    IAM policy fields such as ``Action``/``Resource``/``Statement`` can be
+    either a scalar or a list; normalizing here keeps the denylist logic
+    simple and symmetric.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _action_service(action: str) -> str:
+    """Return the service prefix of an IAM action string, lowercased.
+
+    ``"iam:CreateRole"`` -> ``"iam"``. Returns ``""`` for malformed actions,
+    which the caller treats as a validation error.
+    """
+    if not isinstance(action, str) or ":" not in action:
+        return ""
+    return action.split(":", 1)[0].strip().lower()
+
+
+def _check_statement(filename: str, idx: int, statement) -> list:
+    """Return a list of error messages for one Statement entry.
+
+    Rules applied here mirror the mitigation in the finding:
+      * Reject ``NotAction``/``NotResource`` in Allow statements (hard to reason
+        about and the usual way wildcard-admin policies get smuggled in).
+      * Reject ``Action: "*"`` (full wildcard).
+      * Reject any action in :data:`PRIVILEGE_ESCALATION_ACTIONS`.
+      * Reject ``Resource: "*"`` combined with an action from a service in
+        :data:`SENSITIVE_WILDCARD_RESOURCE_SERVICES`.
+      * Reject service-level wildcards (``"<svc>:*"``) on those same sensitive
+        services even when ``Resource`` is not ``"*"``.
+    """
+    errors: list = []
+
+    if not isinstance(statement, dict):
+        return [f"{filename}#stmt-{idx}: Statement must be an object, got {type(statement).__name__}"]
+
+    effect = statement.get("Effect", "Allow")
+    # Deny statements that use NotAction/NotResource are a safe idiom (deny
+    # everything except...) and have no privilege-escalation potential, so we
+    # only enforce the denylist against Allow (the default when Effect is absent).
+    if effect != "Allow":
+        return errors
+
+    sid = statement.get("Sid", f"stmt-{idx}")
+    where = f"{filename}#{sid}"
+
+    if "NotAction" in statement:
+        errors.append(
+            f"{where}: NotAction is not permitted in Allow statements "
+            "(too easy to accidentally grant admin by exclusion)."
+        )
+    if "NotResource" in statement:
+        errors.append(
+            f"{where}: NotResource is not permitted in Allow statements "
+            "(too easy to accidentally grant admin by exclusion)."
+        )
+
+    actions = _as_list(statement.get("Action"))
+    resources = _as_list(statement.get("Resource"))
+    has_star_resource = any(r == "*" for r in resources if isinstance(r, str))
+
+    for action in actions:
+        if not isinstance(action, str):
+            errors.append(
+                f"{where}: Action entry must be a string, got {type(action).__name__}: {action!r}"
+            )
+            continue
+
+        normalized = action.strip().lower()
+
+        if normalized == "*":
+            errors.append(
+                f"{where}: Action \"*\" is not permitted "
+                "(unconstrained administrator access)."
+            )
+            continue
+
+        if normalized in PRIVILEGE_ESCALATION_ACTIONS:
+            errors.append(
+                f"{where}: Action {action!r} is a known privilege-escalation "
+                "primitive and is not permitted in customer-managed policies."
+            )
+            continue
+
+        service = _action_service(normalized)
+        if not service:
+            errors.append(
+                f"{where}: Action {action!r} is malformed (expected '<service>:<action>')."
+            )
+            continue
+
+        # Service-level wildcard on a sensitive service, regardless of Resource.
+        if normalized == f"{service}:*" and service in SENSITIVE_WILDCARD_RESOURCE_SERVICES:
+            errors.append(
+                f"{where}: Action {action!r} grants wildcard access to a "
+                "security-sensitive service and is not permitted."
+            )
+            continue
+
+        # Any action on a sensitive service combined with Resource: "*".
+        if has_star_resource and service in SENSITIVE_WILDCARD_RESOURCE_SERVICES:
+            errors.append(
+                f"{where}: Action {action!r} on Resource \"*\" is not permitted "
+                f"({service} actions must be scoped to a concrete ARN)."
+            )
+
+    return errors
+
+
+def validate_policy_documents(policies: dict) -> None:
+    """Reject policy documents that contain known privilege-escalation patterns.
+
+    Raises ``ValueError`` listing every offending ``filename#Sid`` so the
+    operator fixes all of them in one iteration instead of whack-a-mole.
+
+    This is the content check the ``TemplateValidation`` stage promises in
+    the README but did not implement; the deploy script also calls it before
+    every ``iam:CreatePolicy``/``iam:CreatePolicyVersion`` as defense in depth.
+    """
+    all_errors: list = []
+
+    for filename, doc in policies.items():
+        if not isinstance(doc, dict):
+            all_errors.append(
+                f"{filename}: top-level JSON must be an object, got {type(doc).__name__}"
+            )
+            continue
+
+        policy_document = doc.get("PolicyDocument")
+        if not isinstance(policy_document, dict):
+            all_errors.append(
+                f"{filename}: PolicyDocument must be an object, "
+                f"got {type(policy_document).__name__}"
+            )
+            continue
+
+        statements = _as_list(policy_document.get("Statement"))
+        if not statements:
+            all_errors.append(
+                f"{filename}: PolicyDocument.Statement is empty or missing."
+            )
+            continue
+
+        for idx, statement in enumerate(statements):
+            all_errors.extend(_check_statement(filename, idx, statement))
+
+    if all_errors:
+        for err in all_errors:
+            LOG.error(err)
+        raise ValueError(
+            f"Rejected {len(all_errors)} privilege-escalation pattern(s) in policy templates."
+        )
+
+    LOG.info("All policy documents passed the privilege-escalation denylist.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,6 +487,7 @@ def main() -> int:
 
         validate_unique_policy_name(policies)
         validate_policy_paths(policies)
+        validate_policy_documents(policies)
 
         # Validate Target account IDs only if the assignments folder was given.
         # Loud warning if missing so it does not silently skip.
