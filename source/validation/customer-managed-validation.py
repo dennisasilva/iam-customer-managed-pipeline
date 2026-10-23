@@ -56,6 +56,27 @@ POLICY_PATH_MAX_LENGTH = 512
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
 
+def _load_allowed_account_ids() -> "set[str] | None":
+    """Return the ``ALLOWED_ACCOUNT_IDS`` allow-list, or ``None`` when unset/empty.
+
+    When set (pipeline injects this env var via the CodeBuild projects in
+    ``cfn/cx-mng-pipeline.yaml`` / ``terraform/codebuild.tf``), the
+    template-validation stage rejects any Target account that is not in
+    the list, so an out-of-organization account ID fails the stage before
+    any STS call is attempted anywhere in the pipeline.
+    """
+    raw = os.environ.get("ALLOWED_ACCOUNT_IDS", "").strip()
+    if not raw:
+        return None
+    parsed = {token.strip() for token in raw.split(",") if token.strip()}
+    invalid = sorted(a for a in parsed if not ACCOUNT_ID_PATTERN.match(a))
+    if invalid:
+        raise ValueError(
+            f"ALLOWED_ACCOUNT_IDS env var contains invalid 12-digit entries: {invalid}"
+        )
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     """Parse and return the command-line arguments."""
     parser = argparse.ArgumentParser(description="Customer-managed policies validation")
@@ -188,13 +209,21 @@ def load_assignment_files(folder: str) -> dict:
 
 
 def validate_target_account_ids(assignments: dict) -> None:
-    """Raise ``ValueError`` if any ``Target`` entry is not a 12-digit account ID.
+    """Raise ``ValueError`` if any ``Target`` entry is not a 12-digit account ID
+    or is outside the ``ALLOWED_ACCOUNT_IDS`` allow-list (when configured).
 
     Account IDs that fall through here lead to confusing AccessDenied errors at
     runtime (when ``sts.assume_role`` fails). Catching them at template-validation
     time gives the operator a clear, file-scoped error message instead.
+
+    The allow-list check is the application-layer complement of the IAM
+    ``aws:ResourceAccount`` / ``aws:ResourceOrgID`` condition on the pipeline
+    role: it stops the stage *before* any STS call is attempted so a
+    repository writer cannot make the pipeline probe arbitrary foreign
+    accounts.
     """
     errors: list = []
+    allowed = _load_allowed_account_ids()
 
     for filename, data in assignments.items():
         if not isinstance(data, dict):
@@ -223,6 +252,14 @@ def validate_target_account_ids(assignments: dict) -> None:
                     errors.append(
                         f"{filename}#{sid}: invalid account ID {account_id!r} "
                         f"(must be exactly 12 digits, no leading/trailing whitespace)"
+                    )
+                elif allowed is not None and account_id not in allowed:
+                    errors.append(
+                        f"{filename}#{sid}: account ID {account_id!r} is outside "
+                        f"the ALLOWED_ACCOUNT_IDS allow-list; add it to the "
+                        f"AllowedAccountIds stack parameter (or terraform "
+                        f"variable allowed_account_ids) if it really belongs "
+                        f"to the pipeline's management scope."
                     )
 
     if errors:

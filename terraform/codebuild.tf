@@ -67,6 +67,10 @@ resource "aws_codebuild_project" "template_validation" {
       name  = "REGION"
       value = local.region
     }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
+    }
   }
 
   source {
@@ -94,6 +98,10 @@ resource "aws_codebuild_project" "role_validation" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
     }
   }
 
@@ -126,6 +134,10 @@ resource "aws_codebuild_project" "dry_run" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
     }
   }
 
@@ -162,6 +174,10 @@ resource "aws_codebuild_project" "customer_managed_policies" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "ALLOWED_ACCOUNT_IDS"
+      value = join(",", var.allowed_account_ids)
     }
   }
 

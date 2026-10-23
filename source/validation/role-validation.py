@@ -49,6 +49,36 @@ ROLE_NAME = "deploy-customer-managed-policy"
 # re-validate before any STS call.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+# Pipeline-wide allow-list of accounts this build is permitted to manage,
+# injected as a comma-separated ``ALLOWED_ACCOUNT_IDS`` environment variable
+# by every CodeBuild project in cfn/cx-mng-pipeline.yaml / terraform/codebuild.tf.
+# When set, any Target entry in the assignment JSON that is not in this list
+# fails the stage *before* any STS call is attempted, preventing a repository
+# writer from making the pipeline probe arbitrary foreign accounts. The env
+# var is optional (empty / missing) only for local development and tests; in
+# that case the containment is still enforced by the IAM-side
+# aws:ResourceAccount / aws:ResourceOrgID condition on the pipeline role.
+
+
+def _load_allowed_account_ids() -> "set[str] | None":
+    """Return the parsed allow-list, or ``None`` when the env var is unset/empty.
+
+    Each entry must match :data:`ACCOUNT_ID_PATTERN`; invalid entries cause
+    the process to exit non-zero so a misconfigured pipeline fails loudly
+    instead of silently falling back to "allow any 12-digit account".
+    """
+    raw = os.environ.get("ALLOWED_ACCOUNT_IDS", "").strip()
+    if not raw:
+        return None
+    parsed = {token.strip() for token in raw.split(",") if token.strip()}
+    invalid = sorted(a for a in parsed if not ACCOUNT_ID_PATTERN.match(a))
+    if invalid:
+        LOG.error(
+            "ALLOWED_ACCOUNT_IDS contains invalid 12-digit entries: %s", invalid
+        )
+        sys.exit(1)
+    return parsed
+
 # Regex for chars *not* allowed in IAM RoleSessionName (allowed: [\w+=,.@-]).
 _SESSION_NAME_INVALID_CHARS = re.compile(r"[^\w+=,.@-]")
 
@@ -95,15 +125,23 @@ def parse_args() -> argparse.Namespace:
 def get_target_accounts(folder: str) -> set:
     """Read every ``*.json`` file in ``folder`` and return the union of all ``Target`` arrays.
 
-    Exits the process with status 1 if the folder does not exist or if any
-    Target entry is not a 12-digit account ID.
+    Exits the process with status 1 if the folder does not exist, if any
+    Target entry is not a 12-digit account ID, or if any Target entry is
+    outside the ``ALLOWED_ACCOUNT_IDS`` allow-list (when set). The allow-list
+    check is the application-layer complement of the IAM
+    ``aws:ResourceAccount`` / ``aws:ResourceOrgID`` condition on the pipeline
+    role: it stops the stage *before* any ``sts:AssumeRole`` is attempted,
+    so a repository writer cannot use the build log as a reconnaissance
+    oracle against accounts outside the pipeline's management scope.
     """
     if not os.path.isdir(folder):
         LOG.error("Assignments folder '%s' not found.", folder)
         sys.exit(1)
 
+    allowed = _load_allowed_account_ids()
     accounts: set = set()
     invalid: list = []
+    out_of_scope: list = []
 
     for filename in os.listdir(folder):
         if not filename.endswith(".json"):
@@ -113,6 +151,9 @@ def get_target_accounts(folder: str) -> set:
         for assignment in data.get("Assignments", []):
             for account_id in assignment.get("Target", []):
                 if isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id):
+                    if allowed is not None and account_id not in allowed:
+                        out_of_scope.append(f"{filename}: {account_id}")
+                        continue
                     accounts.add(account_id)
                 else:
                     invalid.append(f"{filename}: {account_id!r}")
@@ -125,7 +166,19 @@ def get_target_accounts(folder: str) -> set:
         )
         sys.exit(1)
 
-    LOG.info("Target accounts discovered: %s", accounts)
+    if out_of_scope:
+        LOG.error(
+            "Target account ID(s) outside the ALLOWED_ACCOUNT_IDS allow-list: %s",
+            out_of_scope,
+        )
+        LOG.error(
+            "Add these accounts to the AllowedAccountIds stack parameter "
+            "(or terraform variable allowed_account_ids) if they really "
+            "belong to the pipeline's management scope."
+        )
+        sys.exit(1)
+
+    LOG.info("Target accounts discovered: %d account(s)", len(accounts))
     return accounts
 
 
@@ -159,7 +212,18 @@ def check_role_exists(account_id: str) -> bool:
         LOG.info("[%s] Role '%s' validated successfully.", account_id, ROLE_NAME)
         return True
     except (ClientError, BotoCoreError) as exc:
-        LOG.error("[%s] Role '%s' is not accessible: %s", account_id, ROLE_NAME, exc)
+        # Deliberately NOT logging the raw STS/IAM error text per account:
+        # the verbatim message distinguishes "role does not exist" from
+        # "role exists but denies us", which would turn this stage into a
+        # cross-account existence oracle for any repository writer. Error
+        # class is enough for an operator to triage without disclosing
+        # which specific accounts have the role present.
+        LOG.error(
+            "[%s] Role '%s' is not accessible (%s).",
+            account_id,
+            ROLE_NAME,
+            type(exc).__name__,
+        )
         return False
 
 
@@ -175,7 +239,9 @@ def main() -> int:
     failures = [acct for acct in accounts if not check_role_exists(acct)]
     if failures:
         LOG.error(
-            "Role '%s' is missing or not accessible on accounts: %s", ROLE_NAME, failures
+            "Role '%s' is missing or not accessible on %d account(s).",
+            ROLE_NAME,
+            len(failures),
         )
         LOG.error("Make sure the StackSet has created the role on these accounts.")
         return 1

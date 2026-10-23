@@ -15,6 +15,17 @@ locals {
 
   bucket_arn = aws_s3_bucket.artifacts.arn
 
+  # Condition block applied to every cross-account sts:AssumeRole statement.
+  # Scopes the grant to the pipeline's allow-listed accounts (and, when set,
+  # to the AWS Organizations ID) so a repository writer cannot make the
+  # pipeline attempt an AssumeRole into an out-of-organization account.
+  cross_account_assume_condition = {
+    StringEquals = merge(
+      { "aws:ResourceAccount" = var.allowed_account_ids },
+      var.organization_id == "" ? {} : { "aws:ResourceOrgID" = var.organization_id },
+    )
+  }
+
   logs_statement = {
     Effect   = "Allow"
     Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
@@ -78,9 +89,10 @@ resource "aws_iam_role_policy" "role_validation" {
       },
       local.kms_via_s3_statement,
       {
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
+        Effect    = "Allow"
+        Action    = "sts:AssumeRole"
+        Resource  = local.deploy_role_arn
+        Condition = local.cross_account_assume_condition
       },
     ]
   })
@@ -108,9 +120,10 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
       },
       local.kms_via_s3_statement,
       {
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
+        Effect    = "Allow"
+        Action    = "sts:AssumeRole"
+        Resource  = local.deploy_role_arn
+        Condition = local.cross_account_assume_condition
       },
     ]
   })

@@ -64,6 +64,39 @@ variable "manual_approval" {
   default     = true
 }
 
+variable "allowed_account_ids" {
+  description = <<-EOT
+    Lista de contas AWS (12 dígitos) que esta pipeline tem permissão para gerenciar.
+    Usada como fronteira de contenção: aplicada tanto nas policies IAM (via a
+    condição aws:ResourceAccount no sts:AssumeRole) quanto nos scripts Python
+    (via a variável de ambiente ALLOWED_ACCOUNT_IDS). Qualquer Target em
+    templates/assignments/*.json fora dessa lista falha a pipeline antes de
+    qualquer chamada STS.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.allowed_account_ids) > 0 && alltrue([for a in var.allowed_account_ids : can(regex("^\\d{12}$", a))])
+    error_message = "allowed_account_ids deve ser uma lista não-vazia de IDs de conta AWS com exatamente 12 dígitos."
+  }
+}
+
+variable "organization_id" {
+  description = <<-EOT
+    AWS Organizations ID (formato o-xxxxxxxxxx) ao qual a pipeline está
+    restrita. Quando fornecido, uma condição aws:ResourceOrgID é adicionada
+    aos sts:AssumeRole cross-account. Deixe vazio para confiar apenas no
+    allow-list allowed_account_ids.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.organization_id == "" || can(regex("^o-[a-z0-9]{10,32}$", var.organization_id))
+    error_message = "organization_id deve ser vazio ou corresponder a o-xxxxxxxxxx."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Observação de escopo (paridade com o CloudFormation):
 #

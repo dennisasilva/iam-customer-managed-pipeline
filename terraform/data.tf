@@ -11,7 +11,12 @@ locals {
   # Mesmo padrão de nome do CFN: ${AccountId}-${Region}-cx-mng-artfcs
   artifact_bucket_name = "${local.account_id}-${local.region}-cx-mng-artfcs"
 
-  # ARN da role cross-account de deploy (criada nas contas-alvo).
+  # ARN da role cross-account de deploy (criada nas contas-alvo). O wildcard
+  # na parte da conta é mantido para permitir que a lista de contas gerenciadas
+  # seja alterada via var.allowed_account_ids sem reescrever o Resource; a
+  # fronteira de contenção real é aplicada pela Condition
+  # aws:ResourceAccount / aws:ResourceOrgID (ver local.cross_account_assume_condition
+  # em iam.tf).
   deploy_role_arn = "arn:aws:iam::*:role/deploy-customer-managed-policy"
 
   # Seleciona a conexão CodeStar de acordo com o tipo de repositório.

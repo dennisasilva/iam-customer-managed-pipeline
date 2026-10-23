@@ -72,6 +72,40 @@ BOTO3_CONFIG = Config(
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
 
+def _load_allowed_account_ids() -> "set[str] | None":
+    """Return the parsed ``ALLOWED_ACCOUNT_IDS`` allow-list, or ``None`` when unset.
+
+    The pipeline injects this environment variable (comma-separated 12-digit
+    IDs) in every CodeBuild project; see ``cfn/cx-mng-pipeline.yaml`` and
+    ``terraform/codebuild.tf``. It is the application-layer complement of the
+    IAM ``aws:ResourceAccount`` / ``aws:ResourceOrgID`` condition on the
+    pipeline role: it stops the stage before any ``sts:AssumeRole`` is
+    attempted against an out-of-scope account, which (a) prevents a
+    repository writer from making the pipeline probe arbitrary foreign
+    accounts and (b) keeps the IAM-mutation blast radius bounded to the
+    accounts the pipeline is explicitly permitted to manage. Invalid entries
+    fail loudly instead of silently falling back.
+    """
+    raw = os.environ.get("ALLOWED_ACCOUNT_IDS", "").strip()
+    if not raw:
+        return None
+    parsed = {token.strip() for token in raw.split(",") if token.strip()}
+    invalid = sorted(a for a in parsed if not ACCOUNT_ID_PATTERN.match(a))
+    if invalid:
+        raise ValueError(
+            f"ALLOWED_ACCOUNT_IDS contains invalid 12-digit entries: {invalid}"
+        )
+    return parsed
+
+
+# Cached allow-list, resolved on first use so ``_validate_account_id``
+# picks up ``ALLOWED_ACCOUNT_IDS`` whether it is set at import time or
+# later (e.g. in tests that monkeypatch the environment). ``False`` means
+# "not resolved yet"; ``None`` means "env var not set / empty" (no
+# allow-list enforced at the app layer); a ``set`` means the allow-list.
+_ALLOWED_ACCOUNT_IDS = False
+
+
 # Default location of the JSON templates relative to this script's CWD. The
 # pipeline's buildspec runs the script from ``source/customer-managed-policies/``,
 # which is why the defaults walk two levels up. Both can be overridden on the
@@ -133,17 +167,34 @@ def filter_tags(tags: list) -> list:
 
 
 def _validate_account_id(account_id, context: str) -> None:
-    """Raise ``ValueError`` if ``account_id`` is not a 12-digit string.
+    """Raise ``ValueError`` if ``account_id`` is not a 12-digit string or is out of scope.
 
     ``context`` should describe where the value came from (e.g. assignment
     file + SID), so the error message points the operator at the offending
     JSON entry instead of just the value.
+
+    When the ``ALLOWED_ACCOUNT_IDS`` environment variable is set, the account
+    must also be present in that allow-list. This is the application-layer
+    complement of the IAM ``aws:ResourceAccount`` / ``aws:ResourceOrgID``
+    condition on the pipeline role and stops the deploy before any
+    ``sts:AssumeRole`` is attempted against an out-of-scope account.
     """
+    global _ALLOWED_ACCOUNT_IDS
     if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id)):
         raise ValueError(
             f"Invalid Target account ID {account_id!r} in {context}. "
             f"Must be exactly 12 digits "
             f"(did the TemplateValidation stage run before this?)."
+        )
+    if _ALLOWED_ACCOUNT_IDS is False:
+        _ALLOWED_ACCOUNT_IDS = _load_allowed_account_ids()
+    allowed = _ALLOWED_ACCOUNT_IDS
+    if allowed is not None and account_id not in allowed:
+        raise ValueError(
+            f"Target account ID {account_id!r} in {context} is outside the "
+            f"ALLOWED_ACCOUNT_IDS allow-list. Add it to the AllowedAccountIds "
+            f"stack parameter (or terraform variable allowed_account_ids) if "
+            f"it really belongs to the pipeline's management scope."
         )
 
 

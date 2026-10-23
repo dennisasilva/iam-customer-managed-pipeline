@@ -112,6 +112,30 @@
         - 'false'
       Default: 'true'
 
+    AllowedAccountIds:
+      Description: >-
+        Comma-separated list of 12-digit AWS account IDs this pipeline is
+        allowed to manage. Used as a containment boundary: it is enforced
+        both in the pipeline IAM policies (via the aws:ResourceAccount
+        condition on sts:AssumeRole) and in the Python validation and
+        deploy scripts (via the ALLOWED_ACCOUNT_IDS environment variable).
+        Any Target entry in templates/assignments/*.json that is not in
+        this list fails the pipeline before any STS call is attempted.
+      Type: CommaDelimitedList
+      ConstraintDescription: 'Must be a comma-separated list of 12-digit AWS account IDs.'
+
+    OrganizationId:
+      Description: >-
+        AWS Organizations ID (format: o-xxxxxxxxxx) the pipeline is scoped
+        to. When provided, an aws:ResourceOrgID condition is added to the
+        cross-account sts:AssumeRole statements, so the pipeline can only
+        assume into roles that belong to this organization. Leave empty to
+        rely solely on the AllowedAccountIds allow-list.
+      Type: String
+      Default: ''
+      AllowedPattern: '^(o-[a-z0-9]{10,32})?$'
+      ConstraintDescription: 'OrganizationId must be empty or match o-xxxxxxxxxx.'
+
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
   ## +------------------------------------------------------+ ##
@@ -120,6 +144,7 @@
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
     cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
+    cHasOrganizationId: !Not [ !Equals [ !Ref OrganizationId, '' ] ]
 
   Resources:
 
@@ -182,6 +207,8 @@
               Value: America/Sao_Paulo
             - Name: REGION
               Value: !Sub ${AWS::Region}
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [',', !Ref AllowedAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -223,6 +250,8 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [',', !Ref AllowedAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -265,6 +294,8 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [',', !Ref AllowedAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -306,6 +337,8 @@
               Value: America/Sao_Paulo
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_ACCOUNT_IDS
+              Value: !Join [',', !Ref AllowedAccountIds]
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -384,6 +417,18 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # Scope the cross-account grant to the accounts the
+                  # pipeline is allowed to manage, and (when provided) the
+                  # organization it belongs to. The wildcard in Resource is
+                  # kept so AllowedAccountIds can be changed via a stack
+                  # parameter update without rewriting the Resource list;
+                  # the Condition is what actually enforces the boundary.
+                  Condition:
+                    StringEquals: !If
+                      - cHasOrganizationId
+                      - aws:ResourceAccount: !Ref AllowedAccountIds
+                        aws:ResourceOrgID: !Ref OrganizationId
+                      - aws:ResourceAccount: !Ref AllowedAccountIds
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +547,16 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # Scope the cross-account grant to the accounts the
+                  # pipeline is allowed to manage, and (when provided) the
+                  # organization it belongs to. See CodeBuildRoleRoleValidation
+                  # for the full rationale.
+                  Condition:
+                    StringEquals: !If
+                      - cHasOrganizationId
+                      - aws:ResourceAccount: !Ref AllowedAccountIds
+                        aws:ResourceOrgID: !Ref OrganizationId
+                      - aws:ResourceAccount: !Ref AllowedAccountIds
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##
