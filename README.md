@@ -16,11 +16,12 @@ flowchart LR
 
     subgraph Pipeline["Conta de Pipeline"]
       direction TB
-      S["Source"] --> TV["TemplateValidation"] --> RV["RoleValidation"] --> DR["DryRun"] --> AP["Approval<br/>(manual, opcional)"] --> CMP["CustomerManagedPolicies"]
+      S["Source"] --> TV["TemplateValidation"] --> AP["Approval<br/>(manual, opcional)"] --> RV["RoleValidation"] --> DR["DryRun"] --> CMP["CustomerManagedPolicies"]
     end
 
     CP --> S
-    RV -. "valida acesso à role" .-> Role
+    RV -. "valida acesso à role" .-> ValRole
+    DR -. "sts:AssumeRole + ReadOnlyExternalId" .-> ValRole["validate-customer-managed-policy<br/>(read-only, cada conta-alvo)"]
     CMP -->|"sts:AssumeRole + ExternalId"| Role["deploy-customer-managed-policy<br/>(cada conta-alvo)"]
     Role --> IAM[("IAM Customer Managed Policies<br/>tag cx-mng:true")]
     CMP <-->|"state I/O"| S3[("Artifact Bucket + State<br/>SSE-KMS")]

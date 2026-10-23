@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # CodePipeline V2 — paridade com o CodePipeline do CFN.
-# Estágios: Source -> TemplateValidation -> RoleValidation -> DryRun ->
-#           [Approval (opcional)] -> CustomerManagedPolicies
+# Estágios: Source -> TemplateValidation -> [Approval (opcional)] ->
+#           RoleValidation -> DryRun -> CustomerManagedPolicies
+# A aprovação manual é colocada ANTES de qualquer estágio com credenciais
+# cross-account para que código advindo do repositório nunca execute com
+# credenciais privilegiadas sem revisão humana.
 
 resource "aws_codepipeline" "pipeline" {
   name          = "${var.naming_convention}-pipeline"
@@ -47,6 +50,28 @@ resource "aws_codepipeline" "pipeline" {
     }
   }
 
+  # Estágio de aprovação manual — posicionado ANTES de qualquer estágio que
+  # carregue credenciais cross-account (RoleValidation/DryRun assumem a role
+  # de leitura; CustomerManagedPolicies assume a de escrita). Humano revisa o
+  # commit antes de qualquer AssumeRole em contas-alvo, eliminando o caminho
+  # de execução de código pré-aprovação com credenciais privilegiadas.
+  dynamic "stage" {
+    for_each = var.manual_approval ? [1] : []
+    content {
+      name = "Approval"
+      action {
+        name     = "Approval"
+        category = "Approval"
+        owner    = "AWS"
+        provider = "Manual"
+        version  = "1"
+        configuration = {
+          CustomData = "Review the commit (templates + source scripts) before any stage runs with cross-account credentials."
+        }
+      }
+    }
+  }
+
   stage {
     name = "RoleValidation"
     action {
@@ -75,24 +100,6 @@ resource "aws_codepipeline" "pipeline" {
       output_artifacts = ["DryRunOutput"]
       configuration = {
         ProjectName = aws_codebuild_project.dry_run.name
-      }
-    }
-  }
-
-  # Estágio de aprovação manual — incluído apenas quando manual_approval = true.
-  dynamic "stage" {
-    for_each = var.manual_approval ? [1] : []
-    content {
-      name = "Approval"
-      action {
-        name     = "Approval"
-        category = "Approval"
-        owner    = "AWS"
-        provider = "Manual"
-        version  = "1"
-        configuration = {
-          CustomData = "Review DryRun logs and approve before deploying customer managed policies."
-        }
       }
     }
   }

@@ -2,7 +2,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 AWSTemplateFormatVersion: "2010-09-09"
-Description: 'IAM role used by the customer-managed-policies pipeline to deploy IAM policies into target accounts. Deployed via CloudFormation StackSet.'
+Description: 'IAM roles used by the customer-managed-policies pipeline. One role (validate-customer-managed-policy) is read-only and trusted by the pre-approval pipeline stages (RoleValidation, DryRun). A separate role (deploy-customer-managed-policy) carries write permissions and is trusted ONLY by the post-approval apply stage, enforcing least-privilege at the IAM layer. Deployed via CloudFormation StackSet.'
 
 Parameters:
   PipelineAccountId:
@@ -21,20 +21,37 @@ Parameters:
     AllowedPattern: '^[a-z]([a-z0-9-]*[a-z0-9])?$'
     ConstraintDescription: 'Must be lowercase, start with a letter, end with a letter or number, contain only letters/numbers/hyphens (2-30 chars).'
   ExternalId:
-    Description: 'Shared secret required when the pipeline assumes this role (AWS Well-Architected pattern for cross-account roles). Must match the ExternalId parameter of cx-mng-pipeline.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+    Description: 'Shared secret required when the pipeline assumes the write (apply-stage) role. Must match the ExternalId parameter of cx-mng-pipeline.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
     Type: String
     NoEcho: true
     MinLength: 16
     MaxLength: 64
     AllowedPattern: '^[A-Za-z0-9_-]+$'
     ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
+  ReadOnlyExternalId:
+    Description: 'Shared secret required when the pipeline assumes the read-only (pre-approval) role. MUST be different from ExternalId so a leak of either secret does not give the holder both read and write cross-account access. Must match the ReadOnlyExternalId parameter of cx-mng-pipeline.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+    ConstraintDescription: 'ReadOnlyExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
 
 Resources:
-  DeployCustomerManagedPolicyRole:
+  # ---------------------------------------------------------------------------
+  # Read-only cross-account role used by the pre-approval pipeline stages
+  # (RoleValidation, DryRun). It is intentionally the ONLY role those stages
+  # can assume: even if a committer tampers with the Python the pipeline runs,
+  # IAM will refuse any iam:Create*/Delete*/Tag* call, so the pre-approval
+  # stages cannot mutate IAM in this account. This is the enforcement point
+  # the finding requires - it does not rely on the --dry-run flag inside the
+  # (attacker-modifiable) repo script.
+  # ---------------------------------------------------------------------------
+  ValidateCustomerManagedPolicyRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: deploy-customer-managed-policy
-      Description: 'Role assumed by the pipeline to manage IAM customer-managed policies in this account.'
+      RoleName: validate-customer-managed-policy
+      Description: 'Read-only role assumed by the pipeline pre-approval stages (RoleValidation, DryRun) to inspect IAM customer-managed policies without the ability to mutate them.'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -42,15 +59,65 @@ Resources:
             Principal:
               AWS:
                 - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-role-validation'
+                - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-dry-run'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                # ReadOnlyExternalId is DISTINCT from ExternalId used by the
+                # apply-stage role, so possession of the pre-approval secret
+                # alone cannot be used to assume the write role.
+                'sts:ExternalId': !Ref ReadOnlyExternalId
+      Policies:
+        - PolicyName: customer-managed-policy-readonly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IAMPolicyReadOnly
+                Effect: Allow
+                Action:
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:GetRole
+                  - iam:ListPolicies
+                  - iam:ListPolicyVersions
+                  - iam:ListPolicyTags
+                  - iam:ListEntitiesForPolicy
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/deploy-customer-managed-policy'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/validate-customer-managed-policy'
+      Tags:
+        - Key: cx-mng
+          Value: 'true'
+        - Key: ManagedBy
+          Value: sso-pipeline
+
+  # ---------------------------------------------------------------------------
+  # Write cross-account role used ONLY by the post-approval apply stage. The
+  # trust policy no longer includes the pre-approval CodeBuild service roles,
+  # so even if those pre-approval stages run attacker-modified Python with a
+  # valid ExternalId env var, they cannot reach this role.
+  # ---------------------------------------------------------------------------
+  DeployCustomerManagedPolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: deploy-customer-managed-policy
+      Description: 'Role assumed EXCLUSIVELY by the post-approval apply stage to create/update/delete customer-managed IAM policies in this account.'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                # Only the post-approval apply CodeBuild service role is
+                # trusted. The pre-approval pipeline roles (role-validation
+                # and dry-run) are deliberately NOT listed so the
+                # manual-approval gate cannot be bypassed by code committed
+                # to the tracked branch.
                 - !Sub 'arn:aws:iam::${PipelineAccountId}:role/${NamingConvention}-customer-managed-policies'
             Action: sts:AssumeRole
             Condition:
               StringEquals:
-                # ExternalId acts as a shared secret. Even if the pipeline
-                # account is compromised, an attacker holding only the role
-                # ARN cannot assume this role without also knowing the
-                # ExternalId value (which lives in Secrets-Manager-backed
-                # NoEcho parameters on both stacks).
                 'sts:ExternalId': !Ref ExternalId
       Policies:
         - PolicyName: customer-managed-policy-management

@@ -92,8 +92,13 @@ resource "aws_codebuild_project" "role_validation" {
       value = "America/Sao_Paulo"
     }
     environment_variable {
+      # Pre-approval stage: receives only the READ-ONLY ExternalId.
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      value = var.read_only_external_id
+    }
+    environment_variable {
+      name  = "ROLE_NAME"
+      value = "validate-customer-managed-policy"
     }
   }
 
@@ -107,7 +112,11 @@ resource "aws_codebuild_project" "role_validation" {
 
 resource "aws_codebuild_project" "dry_run" {
   name         = "${var.naming_convention}-dry-run"
-  service_role = aws_iam_role.customer_managed_policies.arn
+  # Dedicated service role whose only cross-account grant is sts:AssumeRole
+  # on validate-customer-managed-policy (READ-ONLY). The DryRun stage can no
+  # longer reach the write role regardless of what the (repo-supplied)
+  # Python does.
+  service_role = aws_iam_role.dry_run.arn
 
   artifacts { type = "CODEPIPELINE" }
 
@@ -124,8 +133,13 @@ resource "aws_codebuild_project" "dry_run" {
       value = aws_s3_bucket.artifacts.id
     }
     environment_variable {
+      # Pre-approval stage: receives only the READ-ONLY ExternalId.
       name  = "EXTERNAL_ID"
-      value = var.external_id
+      value = var.read_only_external_id
+    }
+    environment_variable {
+      name  = "ROLE_NAME"
+      value = "validate-customer-managed-policy"
     }
   }
 

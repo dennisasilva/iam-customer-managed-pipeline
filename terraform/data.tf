@@ -11,8 +11,15 @@ locals {
   # Mesmo padrão de nome do CFN: ${AccountId}-${Region}-cx-mng-artfcs
   artifact_bucket_name = "${local.account_id}-${local.region}-cx-mng-artfcs"
 
-  # ARN da role cross-account de deploy (criada nas contas-alvo).
+  # ARN da role cross-account de ESCRITA (criada nas contas-alvo) - usada
+  # apenas pelo estágio de apply pós-aprovação.
   deploy_role_arn = "arn:aws:iam::*:role/deploy-customer-managed-policy"
+
+  # ARN da role cross-account de LEITURA (criada nas contas-alvo) - usada
+  # pelos estágios de pré-aprovação (RoleValidation, DryRun). Permite apenas
+  # iam:Get*/iam:List* para que código advindo do repositório não possa
+  # mutar IAM antes do gate manual.
+  validate_role_arn = "arn:aws:iam::*:role/validate-customer-managed-policy"
 
   # Seleciona a conexão CodeStar de acordo com o tipo de repositório.
   is_github      = var.repository_type == "GitHub"

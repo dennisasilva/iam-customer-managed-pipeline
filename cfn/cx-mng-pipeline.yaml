@@ -87,13 +87,22 @@
       ConstraintDescription: 'Secret name must contain only letters, numbers, and the characters / _ + = . @ -'
 
     ExternalId:
-      Description: 'Shared secret used when assuming the cross-account deploy role. Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+      Description: 'Shared secret used by the post-approval apply stage when assuming the cross-account WRITE role (deploy-customer-managed-policy). Must match the ExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
       Type: String
       NoEcho: true
       MinLength: 16
       MaxLength: 64
       AllowedPattern: '^[A-Za-z0-9_-]+$'
       ConstraintDescription: 'ExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
+
+    ReadOnlyExternalId:
+      Description: 'Shared secret used by the pre-approval stages (RoleValidation, DryRun) when assuming the cross-account READ-ONLY role (validate-customer-managed-policy). MUST be different from ExternalId so a leak of either secret does not grant both read and write cross-account access. Must match the ReadOnlyExternalId parameter of cx-mng-stackset-deploy-role.yaml exactly. Generate via "openssl rand -hex 32" or similar.'
+      Type: String
+      NoEcho: true
+      MinLength: 16
+      MaxLength: 64
+      AllowedPattern: '^[A-Za-z0-9_-]+$'
+      ConstraintDescription: 'ReadOnlyExternalId must be 16-64 chars: alphanumeric, underscore, hyphen.'
 
     NamingConvention:
       Description: 'Prefix used in IAM role/CodeBuild names. Limited to 30 chars so role names fit the IAM 64-char limit (longest suffix is "-customer-managed-policies").'
@@ -253,7 +262,12 @@
               reason: The CodeBuild is going to use the AWS Managed key.
       Properties:
         Name: !Sub "${NamingConvention}-dry-run"
-        ServiceRole: !GetAtt CodeBuildRoleCustomerManagedPolicies.Arn
+        # Dedicated service role whose only cross-account grant is
+        # sts:AssumeRole on validate-customer-managed-policy (READ-ONLY).
+        # The role cannot assume deploy-customer-managed-policy, so even
+        # repo-supplied Python running here cannot mutate IAM in target
+        # accounts regardless of the --dry-run flag.
+        ServiceRole: !GetAtt CodeBuildRoleDryRun.Arn
         Environment:
           Type: LINUX_CONTAINER
           ComputeType: BUILD_GENERAL1_SMALL
@@ -263,8 +277,12 @@
               Value: America/Sao_Paulo
             - Name: STATE_BUCKET
               Value: !Ref CxMgrartifactsBucket
+            # Pre-approval stages receive ONLY the read-only ExternalId.
+            # The write-role ExternalId is NOT exposed here.
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Value: !Ref ReadOnlyExternalId
+            - Name: ROLE_NAME
+              Value: validate-customer-managed-policy
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -304,8 +322,12 @@
           EnvironmentVariables:
             - Name: TZ
               Value: America/Sao_Paulo
+            # Pre-approval stages receive ONLY the read-only ExternalId.
+            # The write-role ExternalId is NOT exposed here.
             - Name: EXTERNAL_ID
-              Value: !Ref ExternalId
+              Value: !Ref ReadOnlyExternalId
+            - Name: ROLE_NAME
+              Value: validate-customer-managed-policy
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -383,7 +405,74 @@
                 - Effect: Allow
                   Action:
                     - sts:AssumeRole
-                  Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  Resource: "arn:aws:iam::*:role/validate-customer-managed-policy"
+
+  ## +--------------------------------------------------------------------------+ ##
+  ## | Create the CodeBuild role for DryRunCodeBuildProject project             | ##
+  ## | Dedicated service role whose only cross-account grant is sts:AssumeRole  | ##
+  ## | on validate-customer-managed-policy (READ-ONLY). This is the IAM-layer   | ##
+  ## | control that keeps the pre-approval DryRun stage from mutating IAM in    | ##
+  ## | target accounts regardless of what the (repo-supplied) Python does.      | ##
+  ## +--------------------------------------------------------------------------+ ##
+
+    CodeBuildRoleDryRun:
+      Type: AWS::IAM::Role
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: The IAM permissions associate is under review.
+            - id: W28
+              reason: The IAM role is used by CodeBuild project.
+      Properties:
+        RoleName: !Sub "${NamingConvention}-dry-run"
+        Description: CodeBuild role for the DryRun CodeBuild Project (pre-approval, read-only cross-account)
+        Path: /
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CodeBuildPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Required because the artifact bucket is encrypted with
+                  # SSE-KMS (alias/aws/s3). The kms:ViaService condition
+                  # restricts these permissions to KMS calls made by S3 in
+                  # this region only.
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                - Effect: Allow
+                  # Pre-approval stage can ONLY assume the read-only role.
+                  # It explicitly cannot assume deploy-customer-managed-policy.
+                  Action:
+                    - sts:AssumeRole
+                  Resource: "arn:aws:iam::*:role/validate-customer-managed-policy"
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -762,6 +851,27 @@
                 OutputArtifacts:
                   - Name: TemplateValidationOutput
 
+          # Manual approval is placed BEFORE any stage that holds cross-account
+          # credentials (RoleValidation, DryRun both assume into target accounts
+          # with the read-only validate-customer-managed-policy role; the apply
+          # stage CustomerManagedPolicies assumes the write role). This ensures
+          # a human reviews the commit before any pipeline role is used to call
+          # STS against member accounts, closing the pre-approval code-execution
+          # path flagged by the finding.
+          - !If
+            - cManualApproval
+            - Name: Approval
+              Actions:
+                - Name: Approval
+                  ActionTypeId:
+                    Category: Approval
+                    Owner: AWS
+                    Version: '1'
+                    Provider: Manual
+                  Configuration:
+                    CustomData: "Review the commit (templates + source scripts) before any stage runs with cross-account credentials."
+            - !Ref AWS::NoValue
+
           - Name: RoleValidation
             Actions:
               - Name: RoleValidation
@@ -793,20 +903,6 @@
                   - Name: SourceOutput
                 OutputArtifacts:
                   - Name: DryRunOutput
-
-          - !If
-            - cManualApproval
-            - Name: Approval
-              Actions:
-                - Name: Approval
-                  ActionTypeId:
-                    Category: Approval
-                    Owner: AWS
-                    Version: '1'
-                    Provider: Manual
-                  Configuration:
-                    CustomData: "Review DryRun logs and approve before deploying customer managed policies."
-            - !Ref AWS::NoValue
 
           - Name: CustomerManagedPolicies
             Actions:

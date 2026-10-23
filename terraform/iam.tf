@@ -78,15 +78,56 @@ resource "aws_iam_role_policy" "role_validation" {
       },
       local.kms_via_s3_statement,
       {
+        # Pre-approval stage can ONLY assume the read-only validate role.
+        # It explicitly cannot reach deploy-customer-managed-policy.
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
-        Resource = local.deploy_role_arn
+        Resource = local.validate_role_arn
       },
     ]
   })
 }
 
-# ---------- Customer Managed Policies (deploy + dry-run) ----------
+# ---------- Dry Run (pre-approval, read-only cross-account) ----------
+# Dedicated service role so the DryRun stage no longer shares credentials
+# with the apply stage. Its only cross-account grant is sts:AssumeRole on
+# validate-customer-managed-policy (READ-ONLY), which is what enforces the
+# "no IAM mutations before approval" invariant at the IAM layer instead of
+# relying on the --dry-run flag inside a repo-supplied script.
+resource "aws_iam_role" "dry_run" {
+  name               = "${var.naming_convention}-dry-run"
+  description        = "CodeBuild role for the DryRun CodeBuild Project (pre-approval, read-only cross-account)"
+  path               = "/"
+  assume_role_policy = local.codebuild_assume
+}
+
+resource "aws_iam_role_policy" "dry_run" {
+  name = "CodeBuildPolicy"
+  role = aws_iam_role.dry_run.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      local.logs_statement,
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
+      },
+      local.kms_via_s3_statement,
+      {
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = local.validate_role_arn
+      },
+    ]
+  })
+}
+
+# ---------- Customer Managed Policies (apply stage only) ----------
+# Service role for the POST-APPROVAL apply CodeBuild project. Its
+# sts:AssumeRole grant on deploy-customer-managed-policy is the only path
+# in the pipeline that reaches the write role in target accounts; the
+# pre-approval roles cannot reach it.
 resource "aws_iam_role" "customer_managed_policies" {
   name               = "${var.naming_convention}-customer-managed-policies"
   description        = "CodeBuild role for Customer Managed Policies CodeBuild Project"

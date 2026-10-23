@@ -91,19 +91,26 @@ def test_get_target_accounts_exits_on_account_id_with_whitespace(
 def test_check_role_exists_returns_true_when_role_present(
     role_validation_module, aws_credentials
 ):
-    """If the role exists and is assumable, the function returns True."""
+    """If both the assumable role and the target role exist, return True."""
     iam = boto3.client("iam", region_name="us-east-1")
-    iam.create_role(
-        RoleName=role_validation_module.ROLE_NAME,
-        AssumeRolePolicyDocument=json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "lambda.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }],
-        }),
-    )
+    trust = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    # The read-only role the pre-approval stage actually assumes.
+    iam.create_role(RoleName=role_validation_module.ROLE_NAME, AssumeRolePolicyDocument=trust)
+    # The write role whose existence we are validating. Skipped when the
+    # override lands both names on the same string (keeps existing single-role
+    # test fixtures happy).
+    if role_validation_module.TARGET_ROLE_NAME != role_validation_module.ROLE_NAME:
+        iam.create_role(
+            RoleName=role_validation_module.TARGET_ROLE_NAME,
+            AssumeRolePolicyDocument=trust,
+        )
 
     # moto STS lets you assume any role ARN; with the role created it will succeed.
     assert role_validation_module.check_role_exists("123456789012") is True

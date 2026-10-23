@@ -37,13 +37,24 @@ variable "branch_name" {
 }
 
 variable "external_id" {
-  description = "Shared secret usado em todo sts:AssumeRole cross-account. Deve ser IGUAL ao ExternalId da role de deploy nas contas-alvo. Gere via 'openssl rand -hex 32'."
+  description = "Shared secret usado pelo estágio de apply (pós-aprovação) ao assumir a role de ESCRITA cross-account (deploy-customer-managed-policy). Deve ser IGUAL ao ExternalId da role de deploy nas contas-alvo. Gere via 'openssl rand -hex 32'."
   type        = string
   sensitive   = true
 
   validation {
     condition     = can(regex("^[A-Za-z0-9_-]{16,64}$", var.external_id))
     error_message = "external_id deve ter 16-64 caracteres: alfanuméricos, hífen ou underscore."
+  }
+}
+
+variable "read_only_external_id" {
+  description = "Shared secret usado pelos estágios de pré-aprovação (RoleValidation, DryRun) ao assumir a role de LEITURA cross-account (validate-customer-managed-policy). DEVE ser diferente de external_id para que o vazamento de um segredo não conceda acesso de leitura E escrita. Gere via 'openssl rand -hex 32'."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{16,64}$", var.read_only_external_id)) && var.read_only_external_id != var.external_id
+    error_message = "read_only_external_id deve ter 16-64 caracteres alfanuméricos (ou - / _) E ser DIFERENTE de external_id."
   }
 }
 

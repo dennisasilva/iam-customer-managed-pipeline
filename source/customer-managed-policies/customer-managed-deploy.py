@@ -79,9 +79,13 @@ ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 DEFAULT_ASSIGNMENTS_DIR = "../../templates/assignments"
 DEFAULT_POLICIES_DIR = "../../templates/customer-managed-policies"
 
-# Cross-account role assumed by the pipeline in every target account. Created by
-# the ``cx-mng-stackset-deploy-role.yaml`` StackSet.
-ROLE_NAME = "deploy-customer-managed-policy"
+# Cross-account role assumed by the pipeline in every target account. The
+# post-approval apply stage assumes ``deploy-customer-managed-policy``
+# (write); the pre-approval DryRun stage assumes
+# ``validate-customer-managed-policy`` (READ-ONLY) by setting the
+# ``ROLE_NAME`` environment variable. IAM is the enforcement point for the
+# dry-run invariant, not the ``--dry-run`` CLI flag.
+ROLE_NAME = os.environ.get("ROLE_NAME", "deploy-customer-managed-policy")
 
 
 # --------------------------------------------------------------------------- #

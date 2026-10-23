@@ -40,9 +40,19 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 
-# Name of the IAM role expected to exist in each target account. Created by
-# the ``cx-mng-stackset-deploy-role.yaml`` StackSet.
-ROLE_NAME = "deploy-customer-managed-policy"
+# Name of the IAM role expected to exist in each target account. This is the
+# role the apply (post-approval) stage will later assume. We only *read* its
+# metadata here; the actual sts:AssumeRole call made by this stage targets
+# the READ-ONLY ``validate-customer-managed-policy`` role, so pre-approval
+# code execution cannot escalate to the write role even if this file is
+# tampered with in the Git source artifact.
+#
+# Both role names can be overridden via environment variables so tests and
+# local runs can point at a single-role setup:
+#   * ``ROLE_NAME``        - the role this script assumes (read-only).
+#   * ``TARGET_ROLE_NAME`` - the role whose existence is being validated.
+ROLE_NAME = os.environ.get("ROLE_NAME", "validate-customer-managed-policy")
+TARGET_ROLE_NAME = os.environ.get("TARGET_ROLE_NAME", "deploy-customer-managed-policy")
 
 # AWS account IDs are exactly 12 digits. Defense-in-depth: this script may run
 # without the upstream TemplateValidation stage (e.g. local debugging), so we
@@ -130,7 +140,16 @@ def get_target_accounts(folder: str) -> set:
 
 
 def check_role_exists(account_id: str) -> bool:
-    """Return True if ``ROLE_NAME`` is assumable from this caller in ``account_id``.
+    """Return True if ``TARGET_ROLE_NAME`` exists in ``account_id`` and the
+    pre-approval stage can read it via the ``ROLE_NAME`` read-only role.
+
+    Flow:
+      1. ``sts:AssumeRole`` into ``ROLE_NAME`` (default
+         ``validate-customer-managed-policy``) — the ONLY cross-account
+         grant held by the pre-approval CodeBuild service role.
+      2. ``iam:GetRole`` on ``TARGET_ROLE_NAME`` (default
+         ``deploy-customer-managed-policy``) to confirm the write role is
+         in place for the post-approval apply stage.
 
     Reads the ``EXTERNAL_ID`` environment variable to satisfy the
     ``sts:ExternalId`` condition on the cross-account role's
@@ -155,11 +174,22 @@ def check_role_exists(account_id: str) -> bool:
             aws_session_token=creds["SessionToken"],
             config=BOTO3_CONFIG,
         )
-        iam.get_role(RoleName=ROLE_NAME)
-        LOG.info("[%s] Role '%s' validated successfully.", account_id, ROLE_NAME)
+        iam.get_role(RoleName=TARGET_ROLE_NAME)
+        LOG.info(
+            "[%s] Role '%s' validated successfully via '%s'.",
+            account_id,
+            TARGET_ROLE_NAME,
+            ROLE_NAME,
+        )
         return True
     except (ClientError, BotoCoreError) as exc:
-        LOG.error("[%s] Role '%s' is not accessible: %s", account_id, ROLE_NAME, exc)
+        LOG.error(
+            "[%s] Could not validate role '%s' via '%s': %s",
+            account_id,
+            TARGET_ROLE_NAME,
+            ROLE_NAME,
+            exc,
+        )
         return False
 
 
@@ -175,7 +205,7 @@ def main() -> int:
     failures = [acct for acct in accounts if not check_role_exists(acct)]
     if failures:
         LOG.error(
-            "Role '%s' is missing or not accessible on accounts: %s", ROLE_NAME, failures
+            "Role '%s' is missing or not accessible on accounts: %s", TARGET_ROLE_NAME, failures
         )
         LOG.error("Make sure the StackSet has created the role on these accounts.")
         return 1
