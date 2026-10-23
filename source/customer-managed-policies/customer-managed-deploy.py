@@ -72,6 +72,35 @@ BOTO3_CONFIG = Config(
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
 
+def _load_allowed_account_ids() -> set:
+    """Return the allow-list of 12-digit account IDs from ``ALLOWED_TARGET_ACCOUNT_IDS``.
+
+    Populated by the pipeline stack from trusted configuration *outside* the
+    triggered repository. Prevents sts:AssumeRole from targeting an attacker-
+    chosen account ID planted in templates/assignments/*.json. An empty return
+    means "not configured" and callers must skip the filter so pre-existing
+    deployments remain functional until the operator rolls the new parameter.
+    """
+    raw = os.environ.get("ALLOWED_TARGET_ACCOUNT_IDS", "").strip()
+    if not raw:
+        return set()
+    allowed = set()
+    bogus = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ACCOUNT_ID_PATTERN.match(entry):
+            allowed.add(entry)
+        else:
+            bogus.append(entry)
+    if bogus:
+        raise ValueError(
+            f"ALLOWED_TARGET_ACCOUNT_IDS contains non-12-digit entries: {bogus!r}"
+        )
+    return allowed
+
+
 # Default location of the JSON templates relative to this script's CWD. The
 # pipeline's buildspec runs the script from ``source/customer-managed-policies/``,
 # which is why the defaults walk two levels up. Both can be overridden on the
@@ -132,18 +161,29 @@ def filter_tags(tags: list) -> list:
     return [t for t in tags if t.get("Key") and t.get("Value")]
 
 
-def _validate_account_id(account_id, context: str) -> None:
+def _validate_account_id(account_id, context: str, allowed_accounts=None) -> None:
     """Raise ``ValueError`` if ``account_id`` is not a 12-digit string.
 
     ``context`` should describe where the value came from (e.g. assignment
     file + SID), so the error message points the operator at the offending
     JSON entry instead of just the value.
+
+    When ``allowed_accounts`` is a non-empty set, also require ``account_id``
+    to be a member of it. This blocks a repo-only commit from steering the
+    cross-account sts:AssumeRole (which carries the ExternalId shared secret)
+    to an attacker-chosen 12-digit account.
     """
     if not (isinstance(account_id, str) and ACCOUNT_ID_PATTERN.match(account_id)):
         raise ValueError(
             f"Invalid Target account ID {account_id!r} in {context}. "
             f"Must be exactly 12 digits "
             f"(did the TemplateValidation stage run before this?)."
+        )
+    if allowed_accounts and account_id not in allowed_accounts:
+        raise ValueError(
+            f"Target account ID {account_id!r} in {context} is not in "
+            f"ALLOWED_TARGET_ACCOUNT_IDS (member accounts allow-list). "
+            f"Refusing to send EXTERNAL_ID to a non-member account."
         )
 
 
@@ -299,6 +339,7 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
     """Iterate every assignment and create or update each policy on each target account."""
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    allowed_accounts = _load_allowed_account_ids()
 
     for assignment_file in os.listdir(args.assignments_folder):
         if not assignment_file.endswith(".json"):
@@ -316,7 +357,11 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
             sid = assignment.get("SID", "?")
 
             for account_id in target_accounts:
-                _validate_account_id(account_id, context=f"{assignment_file}#{sid}")
+                _validate_account_id(
+                    account_id,
+                    context=f"{assignment_file}#{sid}",
+                    allowed_accounts=allowed_accounts,
+                )
                 LOG.info("%sProcessing account: %s", log_prefix, account_id)
                 iam = get_iam_client(account_id)
                 state = load_state(s3_client, account_id, args.state_bucket) if s3_client else {}
@@ -466,6 +511,7 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
     """Remove pipeline-managed policies that are no longer referenced by any assignment."""
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    allowed_accounts = _load_allowed_account_ids()
 
     # Build {account_id: {policy_name, ...}} of policies that should remain in each account.
     policies_per_account: dict = {}
@@ -484,7 +530,11 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
             policies = assignment.get("CustomerManagedPolicyName", [])
             sid = assignment.get("SID", "?")
             for account_id in assignment.get("Target", []):
-                _validate_account_id(account_id, context=f"{assignment_file}#{sid}")
+                _validate_account_id(
+                    account_id,
+                    context=f"{assignment_file}#{sid}",
+                    allowed_accounts=allowed_accounts,
+                )
                 all_target_accounts.add(account_id)
                 policies_per_account.setdefault(account_id, set()).update(policies)
 

@@ -77,11 +77,11 @@ resource "aws_iam_role_policy" "role_validation" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
-      {
+      merge({
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
         Resource = local.deploy_role_arn
-      },
+      }, local.deploy_role_assume_condition),
     ]
   })
 }
@@ -107,11 +107,11 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
       },
       local.kms_via_s3_statement,
-      {
+      merge({
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
         Resource = local.deploy_role_arn
-      },
+      }, local.deploy_role_assume_condition),
     ]
   })
 }

@@ -112,6 +112,37 @@
         - 'false'
       Default: 'true'
 
+    OrganizationId:
+      Description: >-
+        AWS Organizations ID (e.g. o-abcd1234) used to scope the pipeline’s
+        cross-account sts:AssumeRole permission via the aws:ResourceOrgID
+        condition key. When set, both CodeBuild roles can only assume the
+        deploy-customer-managed-policy role in accounts that are members of
+        this organization, which closes the ExternalId-leak path from a
+        repo-only commit (CWE-272). Leave empty to preserve legacy behavior
+        for existing deployments; the ALLOWED_TARGET_ACCOUNT_IDS allow-list in
+        the validation scripts remains available as a secondary control.
+      Type: String
+      Default: ''
+      AllowedPattern: '^$|^o-[a-z0-9]{10,32}$'
+      ConstraintDescription: 'OrganizationId must be empty or match ^o-[a-z0-9]{10,32}$.'
+
+    AllowedTargetAccountIds:
+      Description: >-
+        Comma-separated list of 12-digit AWS account IDs that are permitted to
+        appear in any Target array of templates/assignments/*.json. Injected
+        into every CodeBuild project as the ALLOWED_TARGET_ACCOUNT_IDS env
+        variable; the validation and deploy scripts refuse to call
+        sts:AssumeRole on any account not in the list. The value lives in the
+        pipeline stack (trusted config), NOT in the triggered repository, so
+        a commit cannot bypass it. Leave empty to disable the membership
+        check (not recommended; combine with OrganizationId for defense in
+        depth).
+      Type: String
+      Default: ''
+      AllowedPattern: '^$|^\d{12}(,\d{12})*$'
+      ConstraintDescription: 'AllowedTargetAccountIds must be empty or a comma-separated list of 12-digit IDs with no spaces.'
+
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
   ## +------------------------------------------------------+ ##
@@ -120,6 +151,7 @@
     CreateCodeStarConnectionGitHub: !Equals [ !Ref RepositoryType, 'GitHub' ]
     CreateCodeStarConnectionGitLab: !Equals [ !Ref RepositoryType, 'GitLab' ]
     cManualApproval: !Equals [ !Ref ManualApproval, 'true' ]
+    HasOrganizationId: !Not [ !Equals [ !Ref OrganizationId, '' ] ]
 
   Resources:
 
@@ -182,6 +214,8 @@
               Value: America/Sao_Paulo
             - Name: REGION
               Value: !Sub ${AWS::Region}
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Ref AllowedTargetAccountIds
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -223,6 +257,8 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Ref AllowedTargetAccountIds
         Artifacts:
           Type: CODEPIPELINE
         Source:
@@ -265,6 +301,8 @@
               Value: !Ref CxMgrartifactsBucket
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Ref AllowedTargetAccountIds
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -306,6 +344,8 @@
               Value: America/Sao_Paulo
             - Name: EXTERNAL_ID
               Value: !Ref ExternalId
+            - Name: ALLOWED_TARGET_ACCOUNT_IDS
+              Value: !Ref AllowedTargetAccountIds
         Artifacts:
           Type: CODEPIPELINE
         TimeoutInMinutes: 480
@@ -384,6 +424,19 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # Scope the wildcard-account Resource to this organization
+                  # when OrganizationId is provided (recommended). Without
+                  # this condition, a repo commit that puts a foreign 12-digit
+                  # account ID in templates/assignments/*.json could cause the
+                  # pre-approval RoleValidation stage to send an sts:AssumeRole
+                  # request (carrying the EXTERNAL_ID shared secret) to an
+                  # attacker-chosen account. See cfn/cx-mng-stackset-deploy-role.yaml
+                  # trust policy for the matching external-id condition.
+                  Condition: !If
+                    - HasOrganizationId
+                    - StringEquals:
+                        'aws:ResourceOrgID': !Ref OrganizationId
+                    - !Ref AWS::NoValue
 
   ## +--------------------------------------------------------------------------+ ##
   ## | Create the CodeBuild role for TemplateValidationCodeBuildProject project | ##
@@ -502,6 +555,15 @@
                   Action:
                     - sts:AssumeRole
                   Resource: "arn:aws:iam::*:role/deploy-customer-managed-policy"
+                  # See CodeBuildRoleRoleValidation for rationale. Both roles
+                  # share the aws:ResourceOrgID guard so the deploy and
+                  # dry-run stages (which also receive EXTERNAL_ID) cannot be
+                  # pointed at a non-member account by a repo-only commit.
+                  Condition: !If
+                    - HasOrganizationId
+                    - StringEquals:
+                        'aws:ResourceOrgID': !Ref OrganizationId
+                    - !Ref AWS::NoValue
 
 ## +-------------------------------+ ##
 ## | Create the CodePipeline Role  | ##

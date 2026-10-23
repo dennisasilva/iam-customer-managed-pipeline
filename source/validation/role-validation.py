@@ -49,6 +49,39 @@ ROLE_NAME = "deploy-customer-managed-policy"
 # re-validate before any STS call.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
 
+
+def load_allowed_account_ids() -> set:
+    """Return the allow-list of 12-digit account IDs from ``ALLOWED_TARGET_ACCOUNT_IDS``.
+
+    The env var is a comma-separated list populated by the pipeline stack from
+    trusted configuration (CFN parameter / SSM / Organizations ``ListAccounts``)
+    *outside* the triggered repository. The allow-list is the pre-STS gate that
+    prevents ``check_role_exists`` from sending the ExternalId shared secret to
+    an attacker-chosen 12-digit account added to a ``templates/assignments/*``
+    file. An empty return value means "not configured" and the caller must skip
+    the membership filter (preserves historical behavior for existing stacks
+    not yet updated with the parameter).
+    """
+    raw = os.environ.get("ALLOWED_TARGET_ACCOUNT_IDS", "").strip()
+    if not raw:
+        return set()
+    allowed = set()
+    bogus = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ACCOUNT_ID_PATTERN.match(entry):
+            allowed.add(entry)
+        else:
+            bogus.append(entry)
+    if bogus:
+        LOG.error(
+            "ALLOWED_TARGET_ACCOUNT_IDS contains non-12-digit entries: %s", bogus
+        )
+        sys.exit(1)
+    return allowed
+
 # Regex for chars *not* allowed in IAM RoleSessionName (allowed: [\w+=,.@-]).
 _SESSION_NAME_INVALID_CHARS = re.compile(r"[^\w+=,.@-]")
 
@@ -171,6 +204,29 @@ def main() -> int:
     if not accounts:
         LOG.error("No target accounts found in any assignment file.")
         return 1
+
+    # Allow-list enforcement: never send the EXTERNAL_ID shared secret via
+    # sts:AssumeRole to an account that is not an organization member. The
+    # list comes from ALLOWED_TARGET_ACCOUNT_IDS (trusted config outside the
+    # triggered repository); when the var is empty we skip the filter and log
+    # a warning, so pre-existing stacks that have not yet been updated with
+    # the new parameter continue to work. The IAM-side aws:ResourceOrgID
+    # condition on the CodeBuild policy is the belt to this suspenders.
+    allowed_accounts = load_allowed_account_ids()
+    if allowed_accounts:
+        foreign = sorted(accounts - allowed_accounts)
+        if foreign:
+            LOG.error(
+                "Target account(s) not in ALLOWED_TARGET_ACCOUNT_IDS: %s. "
+                "Refusing to send EXTERNAL_ID to accounts outside the allow-list.",
+                foreign,
+            )
+            return 1
+    else:
+        LOG.warning(
+            "ALLOWED_TARGET_ACCOUNT_IDS is empty or unset; the Target "
+            "account allow-list is NOT enforced in this build."
+        )
 
     failures = [acct for acct in accounts if not check_role_exists(acct)]
     if failures:

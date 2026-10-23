@@ -21,6 +21,15 @@ Runs as part of the pipeline ``TemplateValidation`` stage. Currently performs:
 
 * JSON syntax validation of every ``*.json`` file in the policies folder.
 * Uniqueness check on the ``PolicyName`` field across all policy templates.
+* Allow-list check: every ``Target`` account ID must be a member of the
+  ``ALLOWED_TARGET_ACCOUNT_IDS`` environment variable (comma-separated list of
+  12-digit IDs). The env var is populated by the pipeline stack from trusted
+  configuration (CFN parameter / SSM / Organizations ListAccounts) outside the
+  triggered repository, so a commit that adds a foreign account ID to a
+  ``templates/assignments/*.json`` file now fails validation BEFORE any
+  cross-account STS call is made. When the env var is empty or unset, the
+  check is skipped (backward compatibility; the IAM-side ``aws:ResourceOrgID``
+  condition is the belt to this suspenders).
 
 Arguments:
     --policies-folder:    Folder containing customer-managed policy JSON files.
@@ -54,6 +63,39 @@ POLICY_PATH_MAX_LENGTH = 512
 # whitespace, formatted numbers from spreadsheets, missing leading zeros) leads
 # to confusing AccessDenied errors at runtime when assume_role fails.
 ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+
+
+def load_allowed_account_ids() -> set:
+    """Return the allow-list of 12-digit account IDs from ``ALLOWED_TARGET_ACCOUNT_IDS``.
+
+    The env var is a comma-separated list, populated by the pipeline stack from
+    trusted configuration (CFN parameter, SSM parameter, or Organizations
+    ``ListAccounts`` output) *outside* the triggered repository. Returning an
+    empty set means "no allow-list configured" and the caller should skip the
+    membership check (backward compatibility: existing deployments without the
+    new parameter continue to work; the IAM-side ``aws:ResourceOrgID``
+    condition is the primary defense).
+    """
+    raw = os.environ.get("ALLOWED_TARGET_ACCOUNT_IDS", "").strip()
+    if not raw:
+        return set()
+    allowed = set()
+    bogus = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ACCOUNT_ID_PATTERN.match(entry):
+            allowed.add(entry)
+        else:
+            bogus.append(entry)
+    if bogus:
+        # Fail loudly: a misconfigured allow-list is more dangerous than a
+        # missing one because it would silently reject legitimate accounts.
+        raise ValueError(
+            f"ALLOWED_TARGET_ACCOUNT_IDS contains non-12-digit entries: {bogus!r}"
+        )
+    return allowed
 
 
 def parse_args() -> argparse.Namespace:
@@ -187,13 +229,19 @@ def load_assignment_files(folder: str) -> dict:
     return assignments
 
 
-def validate_target_account_ids(assignments: dict) -> None:
+def validate_target_account_ids(assignments: dict, allowed_accounts=None) -> None:
     """Raise ``ValueError`` if any ``Target`` entry is not a 12-digit account ID.
 
     Account IDs that fall through here lead to confusing AccessDenied errors at
     runtime (when ``sts.assume_role`` fails). Catching them at template-validation
     time gives the operator a clear, file-scoped error message instead.
+
+    When ``allowed_accounts`` is a non-empty set, every Target entry is also
+    required to be a member of it. Pass ``None`` or an empty set to disable the
+    membership check (default; preserves historical behavior).
     """
+    if allowed_accounts is None:
+        allowed_accounts = set()
     errors: list = []
 
     for filename, data in assignments.items():
@@ -223,6 +271,16 @@ def validate_target_account_ids(assignments: dict) -> None:
                     errors.append(
                         f"{filename}#{sid}: invalid account ID {account_id!r} "
                         f"(must be exactly 12 digits, no leading/trailing whitespace)"
+                    )
+                elif allowed_accounts and account_id not in allowed_accounts:
+                    # Allow-list check sourced from ALLOWED_TARGET_ACCOUNT_IDS
+                    # (trusted config outside the repo). Prevents a repo-only
+                    # commit from steering any cross-account STS call to an
+                    # attacker-chosen account before the manual-approval gate.
+                    errors.append(
+                        f"{filename}#{sid}: account ID {account_id!r} is not"
+                        f" in ALLOWED_TARGET_ACCOUNT_IDS (member accounts"
+                        f" allow-list)"
                     )
 
     if errors:
@@ -259,7 +317,21 @@ def main() -> int:
         if args.assignments_folder:
             assignments = load_assignment_files(args.assignments_folder)
             if assignments:
-                validate_target_account_ids(assignments)
+                allowed_accounts = load_allowed_account_ids()
+                if allowed_accounts:
+                    LOG.info(
+                        "Enforcing Target account allow-list (%d accounts) "
+                        "from ALLOWED_TARGET_ACCOUNT_IDS.",
+                        len(allowed_accounts),
+                    )
+                else:
+                    LOG.warning(
+                        "ALLOWED_TARGET_ACCOUNT_IDS is empty or unset; "
+                        "Target account membership check is NOT enforced. "
+                        "The IAM-side aws:ResourceOrgID condition remains "
+                        "the primary defense against foreign-account targeting."
+                    )
+                validate_target_account_ids(assignments, allowed_accounts)
             else:
                 LOG.warning(
                     "Assignments folder '%s' has no JSON files; "

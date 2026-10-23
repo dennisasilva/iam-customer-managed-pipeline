@@ -64,6 +64,44 @@ variable "manual_approval" {
   default     = true
 }
 
+variable "organization_id" {
+  description = <<-EOT
+    AWS Organizations ID (e.g. "o-abcd1234") used to scope the pipeline's
+    cross-account sts:AssumeRole permission via the aws:ResourceOrgID
+    condition key. When set, both CodeBuild roles can only assume the
+    deploy-customer-managed-policy role in accounts that are members of this
+    organization, closing the ExternalId-leak path from a repo-only commit
+    (CWE-272). Leave empty to preserve legacy behavior for existing
+    deployments; combine with allowed_target_account_ids for defense in depth.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.organization_id == "" || can(regex("^o-[a-z0-9]{10,32}$", var.organization_id))
+    error_message = "organization_id deve ser vazio ou corresponder a ^o-[a-z0-9]{10,32}$."
+  }
+}
+
+variable "allowed_target_account_ids" {
+  description = <<-EOT
+    Lista explicita de contas AWS (IDs de 12 digitos) permitidas em qualquer
+    array "Target" de templates/assignments/*.json. Injetada em todos os
+    projetos CodeBuild como a variavel ALLOWED_TARGET_ACCOUNT_IDS; os scripts
+    de validacao e deploy recusam sts:AssumeRole em contas fora da lista.
+    O valor vive no stack da pipeline (configuracao confiavel) e NAO no
+    repositorio alvo, portanto um commit nao consegue burlar o controle.
+    Vazio desativa a checagem (nao recomendado; combine com organization_id).
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for a in var.allowed_target_account_ids : can(regex("^\\d{12}$", a))])
+    error_message = "Cada entrada de allowed_target_account_ids deve ser exatamente 12 digitos."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Observação de escopo (paridade com o CloudFormation):
 #
