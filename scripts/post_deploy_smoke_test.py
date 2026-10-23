@@ -10,10 +10,15 @@ catches the class of failures that ``cfn-lint`` cannot:
 
   * Stack ended up in a failed state (drift between intended template and
     actual deploy result).
-  * Expected IAM roles missing (race condition or naming-convention drift).
-  * S3 artifact bucket not configured with the encryption we asked for.
+  * Expected IAM roles missing or drifted so their trust policy no longer
+    names the expected service principal.
+  * S3 artifact bucket not configured with the encryption we asked for, or
+    missing the HTTPS-only / state/*-write Deny statements the bucket policy
+    is required to carry.
   * CodeStar Connection in a state that will block the Source stage.
-  * CodePipeline / CodeBuild projects missing or disabled.
+  * CodePipeline / CodeBuild projects missing, disabled, or drifted so the
+    pipeline no longer carries the expected stages (including the Manual
+    Approval gate when ``ManualApproval=true``).
 
 The script is **read-only** — no AWS state is modified. Each check prints:
   * What it is checking (concrete resource and property)
@@ -33,9 +38,10 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -151,19 +157,212 @@ def check_stack_status(cfn, stack_name: str) -> bool:
     return status in HEALTHY_STACK_STATUSES
 
 
-def check_iam_role_exists(iam, role_name: str) -> bool:
-    iam.get_role(RoleName=role_name)
+def _trust_policy_services(trust_doc) -> set:
+    """Return the set of Service principals from an AssumeRolePolicyDocument."""
+    services: set = set()
+    if not isinstance(trust_doc, dict):
+        return services
+    for stmt in trust_doc.get("Statement", []) or []:
+        if not isinstance(stmt, dict):
+            continue
+        if stmt.get("Effect") != "Allow":
+            continue
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if "sts:AssumeRole" not in actions:
+            continue
+        principal = stmt.get("Principal", {})
+        if not isinstance(principal, dict):
+            continue
+        svc = principal.get("Service", [])
+        if isinstance(svc, str):
+            services.add(svc)
+        else:
+            services.update(svc or [])
+    return services
+
+
+def check_iam_role_exists(iam, role_name: str, expected_service: str = "codebuild.amazonaws.com") -> bool:
+    """The role must exist and trust the expected AWS service principal.
+
+    Verifying the AssumeRolePolicyDocument closes a false-green where the role
+    exists but has been drifted to trust an unexpected principal (or no
+    principal), which would silently neutralize the pipeline's identity model.
+    """
+    response = iam.get_role(RoleName=role_name)
+    trust_doc = response.get("Role", {}).get("AssumeRolePolicyDocument", {})
+    services = _trust_policy_services(trust_doc)
+    print(f"               Trusted service principals: {sorted(services) or '(none)'}")
+    if expected_service not in services:
+        print(
+            f"               Expected trust for {expected_service!r} not found. "
+            "Trust policy drift detected."
+        )
+        return False
     return True
 
 
-def check_codepipeline_exists(codepipeline, name: str) -> bool:
-    codepipeline.get_pipeline(name=name)
+def check_codepipeline_exists(
+    codepipeline, name: str, require_approval: Optional[bool] = None
+) -> bool:
+    """Pipeline must exist, carry the expected stages, and honor the Approval gate.
+
+    When ``require_approval`` is True, the pipeline must contain an Approval
+    stage with a Manual approval action — the only human gate between a Git
+    commit and ``sts:AssumeRole`` + ``iam:CreatePolicy`` in every target
+    account. When False, we accept its absence (deliberately configured off).
+    When None, the stage check is skipped.
+    """
+    response = codepipeline.get_pipeline(name=name)
+    pipeline = response.get("pipeline", {})
+    stages = pipeline.get("stages", []) or []
+    stage_names = [s.get("name") for s in stages]
+    print(f"               Pipeline stages: {stage_names}")
+
+    # The non-conditional stages that must always be present.
+    required_stages = {
+        "Source",
+        "TemplateValidation",
+        "RoleValidation",
+        "DryRun",
+        "CustomerManagedPolicies",
+    }
+    missing = required_stages - set(stage_names)
+    if missing:
+        print(f"               Missing required stages: {sorted(missing)}")
+        return False
+
+    def _has_manual_approval(stage) -> bool:
+        if stage.get("name") != "Approval":
+            return False
+        for action in stage.get("actions", []) or []:
+            type_id = action.get("actionTypeId", {}) or {}
+            if (
+                type_id.get("category") == "Approval"
+                and type_id.get("provider") == "Manual"
+            ):
+                return True
+        return False
+
+    approval_present = any(_has_manual_approval(s) for s in stages)
+    if require_approval is True and not approval_present:
+        print(
+            "               Manual approval stage missing. The stack was "
+            "deployed with ManualApproval=true but no Approval/Manual action "
+            "is present on the pipeline (possible out-of-band update-pipeline "
+            "drift)."
+        )
+        return False
+    if require_approval is False and approval_present:
+        print(
+            "               Unexpected Manual Approval stage. Stack was "
+            "deployed with ManualApproval=false but the pipeline carries one."
+        )
+        # Not a hard failure: an operator explicitly adding a human gate is
+        # strictly safer than the configured posture, so we warn but pass.
     return True
 
 
 def check_codebuild_project_exists(codebuild, name: str) -> bool:
     response = codebuild.batch_get_projects(names=[name])
     return bool(response.get("projects"))
+
+
+def _bucket_policy_statements(s3, bucket_name: str) -> list:
+    """Return the parsed statement list of the bucket policy, or []"""
+    response = s3.get_bucket_policy(Bucket=bucket_name)
+    doc = json.loads(response["Policy"])
+    statements = doc.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    return statements
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def check_artifact_bucket_https_only(s3, bucket_name: str) -> bool:
+    """Bucket policy must deny all requests over plain HTTP (aws:SecureTransport).
+
+    This is the ``HTTPSOnly`` Deny statement declared by
+    ``cfn/cx-mng-pipeline.yaml`` on the artifact bucket. Losing it (console/CLI
+    delete-bucket-policy, or CFN drift) silently removes the TLS requirement
+    from the pipeline's artifact and state storage.
+    """
+    statements = _bucket_policy_statements(s3, bucket_name)
+    for s in statements:
+        if s.get("Effect") != "Deny":
+            continue
+        actions = set(_as_list(s.get("Action")))
+        if "s3:*" not in actions and not any(a == "s3:*" for a in actions):
+            # Only s3:* (or an explicit superset) qualifies as a global HTTPS
+            # gate. A narrower Action would leave other calls unprotected.
+            continue
+        condition = s.get("Condition", {}) or {}
+        bool_cond = condition.get("Bool", {}) or {}
+        secure_transport = bool_cond.get("aws:SecureTransport")
+        if isinstance(secure_transport, list):
+            secure_transport = secure_transport[0] if secure_transport else None
+        if str(secure_transport).lower() == "false":
+            return True
+    print(
+        "               HTTPSOnly Deny (aws:SecureTransport=false) not found "
+        "in bucket policy."
+    )
+    return False
+
+
+def check_artifact_bucket_state_write_protection(
+    s3, bucket_name: str, deploy_role_arn: Optional[str]
+) -> bool:
+    """Bucket policy must deny PutObject/DeleteObject on state/* to every
+    principal except the deploy CodeBuild role.
+
+    This is the ``RestrictStateWritesToDeployRole`` Deny: it is what makes the
+    drift-detection state in ``state/<account>.json`` trustworthy without
+    HMAC signing. Losing it would allow any principal in the account to tamper
+    with the state files that drive the deploy script's skip/visit decisions.
+    """
+    statements = _bucket_policy_statements(s3, bucket_name)
+    for s in statements:
+        if s.get("Effect") != "Deny":
+            continue
+        actions = set(_as_list(s.get("Action")))
+        if not {"s3:PutObject", "s3:DeleteObject"}.issubset(actions):
+            continue
+        resources = _as_list(s.get("Resource"))
+        if not any("/state/" in r for r in resources):
+            continue
+        condition = s.get("Condition", {}) or {}
+        sne = condition.get("StringNotEquals", {}) or {}
+        allowed_arn = sne.get("aws:PrincipalArn")
+        if isinstance(allowed_arn, list):
+            allowed_arn = allowed_arn[0] if allowed_arn else None
+        if not allowed_arn:
+            print(
+                "               state/ Deny found but it does not except "
+                "a specific aws:PrincipalArn via StringNotEquals."
+            )
+            return False
+        if deploy_role_arn and allowed_arn != deploy_role_arn:
+            print(
+                f"               state/ Deny excepts {allowed_arn!r} but the "
+                f"deploy CodeBuild role is {deploy_role_arn!r}."
+            )
+            return False
+        print(f"               state/ writes restricted to: {allowed_arn}")
+        return True
+    print(
+        "               No Deny on PutObject/DeleteObject for state/* found "
+        "in bucket policy."
+    )
+    return False
 
 
 def check_artifact_bucket_encryption(s3, bucket_name: str) -> bool:
@@ -244,6 +443,24 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
 
     bucket_name = f"{account_id}-{region}-cx-mng-artfcs"
 
+    # Resolve stack parameters we need for posture assertions. In particular
+    # ManualApproval decides whether we insist on the Approval stage.
+    manual_approval_expected: Optional[bool] = None
+    try:
+        stack_desc = cfn.describe_stacks(StackName=stack)["Stacks"][0]
+        for p in stack_desc.get("Parameters", []) or []:
+            if p.get("ParameterKey") == "ManualApproval":
+                manual_approval_expected = str(p.get("ParameterValue", "")).lower() == "true"
+                break
+    except (ClientError, BotoCoreError, KeyError, IndexError):
+        # describe_stacks fail is already covered by the stack-health check
+        # below; here we just leave manual_approval_expected as None so the
+        # pipeline-stage assertion is permissive rather than wrongly failing.
+        manual_approval_expected = None
+
+    deploy_role_name = f"{naming}-customer-managed-policies"
+    deploy_role_arn = f"arn:aws:iam::{account_id}:role/{deploy_role_name}"
+
     _print_banner(stack, region, naming, bucket_name)
 
     results: list[CheckResult] = []
@@ -290,15 +507,15 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
         ),
     )
     expected_roles = [
-        f"{naming}-role-validation",
-        f"{naming}-template-validation",
-        f"{naming}-customer-managed-policies",
-        f"{naming}-code-pipeline",
+        (f"{naming}-role-validation", "codebuild.amazonaws.com"),
+        (f"{naming}-template-validation", "codebuild.amazonaws.com"),
+        (f"{naming}-customer-managed-policies", "codebuild.amazonaws.com"),
+        (f"{naming}-code-pipeline", "codepipeline.amazonaws.com"),
     ]
-    for role in expected_roles:
+    for role, expected_service in expected_roles:
         _run_check(
-            f"IAM role exists: {role}",
-            lambda r=role: check_iam_role_exists(iam, r),
+            f"IAM role exists and trusts {expected_service}: {role}",
+            lambda r=role, svc=expected_service: check_iam_role_exists(iam, r, svc),
             results,
         )
 
@@ -320,8 +537,10 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
         ),
     )
     _run_check(
-        f"CodePipeline exists: {pipeline_name}",
-        lambda: check_codepipeline_exists(codepipeline, pipeline_name),
+        f"CodePipeline exists with expected stages: {pipeline_name}",
+        lambda: check_codepipeline_exists(
+            codepipeline, pipeline_name, require_approval=manual_approval_expected
+        ),
         results,
     )
 
@@ -418,6 +637,66 @@ def main() -> int:  # noqa: PLR0915 - one-shot script with linear setup
     _run_check(
         "Bucket versioning is Enabled",
         lambda: check_artifact_bucket_versioning(s3, bucket_name),
+        results,
+    )
+
+    # ------------------------------------------------------------ #
+    # Bucket policy — HTTPS-only Deny
+    # ------------------------------------------------------------ #
+    _print_section("policy-1", "S3 artifact bucket — HTTPS-only Deny")
+    _print_check_intro(
+        checking=(
+            f"Bucket '{bucket_name}' policy denies requests with "
+            "aws:SecureTransport=false"
+        ),
+        why=(
+            "The HTTPSOnly Deny in the template is what forces TLS on every "
+            "artifact and state read/write. Losing it (delete-bucket-policy, "
+            "console edit, CFN drift) silently permits cleartext S3 access to "
+            "the pipeline's state files."
+        ),
+        on_failure=(
+            "Re-apply cfn/cx-mng-pipeline.yaml so the bucket policy is "
+            "restored, or inspect `aws s3api get-bucket-policy` to see the "
+            "current statements."
+        ),
+    )
+    _run_check(
+        "Bucket policy denies non-TLS requests (HTTPSOnly)",
+        lambda: check_artifact_bucket_https_only(s3, bucket_name),
+        results,
+    )
+
+    # ------------------------------------------------------------ #
+    # Bucket policy — state/* write protection
+    # ------------------------------------------------------------ #
+    _print_section(
+        "policy-2", "S3 artifact bucket — state/* write protection"
+    )
+    _print_check_intro(
+        checking=(
+            f"Bucket '{bucket_name}' policy denies PutObject/DeleteObject on "
+            f"state/* to every principal except {deploy_role_arn}"
+        ),
+        why=(
+            "The state/<account>.json objects decide whether a policy update "
+            "is skipped and which accounts are visited for deletion. The "
+            "RestrictStateWritesToDeployRole Deny is what makes drift state "
+            "trustworthy without HMAC signing: only the deploy CodeBuild role "
+            "is allowed to write it. Losing this Deny lets any principal in "
+            "the account tamper with the state and steer the deploy script."
+        ),
+        on_failure=(
+            "Re-apply cfn/cx-mng-pipeline.yaml so the RestrictStateWrites "
+            "ToDeployRole Deny is restored, and confirm the deploy role ARN "
+            "in the StringNotEquals condition matches the current stack."
+        ),
+    )
+    _run_check(
+        "Bucket policy restricts state/ writes to the deploy CodeBuild role",
+        lambda: check_artifact_bucket_state_write_protection(
+            s3, bucket_name, deploy_role_arn
+        ),
         results,
     )
 
