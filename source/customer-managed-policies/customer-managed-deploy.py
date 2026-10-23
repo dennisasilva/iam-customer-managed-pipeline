@@ -354,10 +354,15 @@ def get_iam_client(account_id: str):
 # --------------------------------------------------------------------------- #
 
 
-def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
-    """Iterate every assignment and create or update each policy on each target account."""
+def create_update_customer_managed_policy(args: argparse.Namespace) -> int:
+    """Iterate every assignment and create or update each policy on each target account.
+
+    Returns the number of per-policy failures observed; callers (``main``) use this
+    to drive a non-zero exit so a failed stage does not report success.
+    """
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    failure_count = 0
 
     for assignment_file in os.listdir(args.assignments_folder):
         if not assignment_file.endswith(".json"):
@@ -452,13 +457,41 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                         LOG.info("%s[%s] UPDATE '%s'", log_prefix, account_id, policy_name)
                         if not args.dry_run:
                             # IAM allows up to 5 versions of a managed policy; if we are
-                            # already at the cap, drop the oldest non-default version first.
-                            versions = iam.list_policy_versions(PolicyArn=policy_arn)["Versions"]
+                            # already at the cap, drop the oldest *non-default* version
+                            # first. The default version cannot be deleted (IAM returns
+                            # DeleteConflictException), so excluding it from the pruning
+                            # candidates avoids a silent failure that would otherwise
+                            # permanently block updates to this policy.
+                            paginator = iam.get_paginator("list_policy_versions")
+                            versions = []
+                            for page in paginator.paginate(PolicyArn=policy_arn):
+                                versions.extend(page.get("Versions", []))
                             if len(versions) >= 5:
-                                oldest = sorted(versions, key=lambda v: v["CreateDate"])[0]
-                                iam.delete_policy_version(
-                                    PolicyArn=policy_arn, VersionId=oldest["VersionId"]
-                                )
+                                candidates = [
+                                    v for v in versions if not v["IsDefaultVersion"]
+                                ]
+                                if not candidates:
+                                    raise RuntimeError(
+                                        f"Cannot prune policy '{policy_name}' in account "
+                                        f"{account_id}: all {len(versions)} versions are "
+                                        "marked default (no non-default version to delete)."
+                                    )
+                                oldest = sorted(candidates, key=lambda v: v["CreateDate"])[0]
+                                try:
+                                    iam.delete_policy_version(
+                                        PolicyArn=policy_arn,
+                                        VersionId=oldest["VersionId"],
+                                    )
+                                except iam.exceptions.DeleteConflictException as exc:
+                                    # IAM refuses to delete the default version. We already
+                                    # filter it out above, so hitting this branch means a
+                                    # concurrent SetDefaultPolicyVersion raced us; fail
+                                    # loudly rather than silently skipping the update.
+                                    raise RuntimeError(
+                                        f"Failed to prune oldest version "
+                                        f"{oldest['VersionId']} of policy "
+                                        f"'{policy_name}' in account {account_id}: {exc}"
+                                    ) from exc
 
                             response = iam.create_policy_version(
                                 PolicyArn=policy_arn,
@@ -508,11 +541,14 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
 
                     except Exception as exc:  # noqa: BLE001 - per-policy failures must not stop the run
                         LOG.error("[%s] Error on '%s': %s", account_id, policy_name, exc)
+                        failure_count += 1
 
                 if not args.dry_run and s3_client:
                     state["account_id"] = account_id
                     state["policies"] = policies_state
                     save_state(s3_client, account_id, state, args.state_bucket)
+
+    return failure_count
 
 
 # --------------------------------------------------------------------------- #
@@ -540,10 +576,14 @@ def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
         return set()
 
 
-def delete_customer_managed_policy(args: argparse.Namespace) -> None:
-    """Remove pipeline-managed policies that are no longer referenced by any assignment."""
+def delete_customer_managed_policy(args: argparse.Namespace) -> int:
+    """Remove pipeline-managed policies that are no longer referenced by any assignment.
+
+    Returns the number of per-policy failures observed.
+    """
     s3_client = boto3.client("s3", config=BOTO3_CONFIG) if args.state_bucket else None
     log_prefix = "[DRY-RUN] " if args.dry_run else ""
+    failure_count = 0
 
     # Build {account_id: {policy_name, ...}} of policies that should remain in each account.
     policies_per_account: dict = {}
@@ -607,6 +647,7 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                     LOG.info("[%s] '%s' deleted.", account_id, policy_name)
             except Exception as exc:  # noqa: BLE001
                 LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
+                failure_count += 1
 
         if not args.dry_run and s3_client:
             state["account_id"] = account_id
@@ -623,6 +664,8 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("[%s] Could not remove state: %s", account_id, exc)
 
+    return failure_count
+
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
@@ -630,11 +673,19 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update first, then delete.
+
+    Returns the total number of per-policy failures observed across both phases
+    so the CodeBuild stage exits non-zero (and therefore fails) when any policy
+    could not be applied. Per-policy errors are still logged individually so the
+    full run completes before the exit code is reported.
+    """
     args = parse_args()
-    create_update_customer_managed_policy(args)
-    delete_customer_managed_policy(args)
-    return 0
+    failures = create_update_customer_managed_policy(args)
+    failures += delete_customer_managed_policy(args)
+    if failures:
+        LOG.error("Completed with %d policy failure(s); stage will exit non-zero.", failures)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
