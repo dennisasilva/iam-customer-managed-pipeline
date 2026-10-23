@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 
 logging.basicConfig(
@@ -82,6 +83,70 @@ DEFAULT_POLICIES_DIR = "../../templates/customer-managed-policies"
 # Cross-account role assumed by the pipeline in every target account. Created by
 # the ``cx-mng-stackset-deploy-role.yaml`` StackSet.
 ROLE_NAME = "deploy-customer-managed-policy"
+
+
+# --------------------------------------------------------------------------- #
+# Run-level failure tracker
+#
+# Any error that must fail the pipeline stage (an un-applied policy document, a
+# failed revocation, an S3/KMS/IAM error that is NOT a tolerated "NoSuchEntity"
+# / "NoSuchKey") appends a short description to this list. ``main()`` returns a
+# non-zero exit code when the list is non-empty so CodeBuild/CodePipeline mark
+# the ``CustomerManagedPolicies`` action failed (CWE-390: Detection of Error
+# Condition Without Action).
+#
+# A corresponding SNS notification is emitted when the ``SNS_TOPIC_ARN``
+# environment variable is set (optional, best-effort), so operators get an
+# actionable alert for drift and un-applied policy documents instead of only a
+# log line buried in CloudWatch Logs.
+# --------------------------------------------------------------------------- #
+
+_run_errors: list = []
+
+# Expected / tolerated botocore error codes (per-API). Anything else counts as
+# an unexpected failure and is accumulated into ``_run_errors``.
+_EXPECTED_LOAD_STATE_CODES = frozenset({"NoSuchKey", "404", "NoSuchBucket"})
+_EXPECTED_GET_POLICY_CODES = frozenset({"NoSuchEntity", "NoSuchEntityException"})
+
+
+def _reset_run_errors() -> None:
+    """Clear the module-level failure tracker. Call at the start of main()."""
+    _run_errors.clear()
+
+
+def _record_failure(message: str) -> None:
+    """Record a run-level failure and emit an optional SNS notification.
+
+    The failure is logged at ERROR and appended to ``_run_errors`` so
+    ``main()`` can return a non-zero exit code at the end of the run.
+    """
+    LOG.error("%s", message)
+    _run_errors.append(message)
+    _notify(subject="customer-managed-deploy failure", message=message)
+
+
+def _notify(subject: str, message: str) -> None:
+    """Best-effort SNS notification; silently no-op if not configured.
+
+    Reads the topic ARN from ``SNS_TOPIC_ARN``. Failures to publish are logged
+    but never raise and never themselves add to ``_run_errors`` (we do not want
+    a broken notification channel to fail the pipeline stage on its own).
+    """
+    topic_arn = os.environ.get("SNS_TOPIC_ARN")
+    if not topic_arn:
+        return
+    try:
+        sns = boto3.client("sns", config=BOTO3_CONFIG)
+        sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+    except Exception as exc:  # noqa: BLE001 - notification path must not raise
+        LOG.warning("SNS notification failed (topic=%s): %s", topic_arn, exc)
+
+
+def _client_error_code(exc: BaseException) -> str:
+    """Return the botocore ClientError code, or empty string if not a ClientError."""
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code", "")
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -173,7 +238,14 @@ def _build_session_name(prefix: str = "CxMngDeploy") -> str:
 
 
 def load_state(s3_client, account_id: str, state_bucket: str) -> dict:
-    """Load ``state/<account_id>.json`` from S3, or {} if missing/unreadable."""
+    """Load ``state/<account_id>.json`` from S3, or {} if missing/unreadable.
+
+    Distinguishes expected conditions (``NoSuchKey`` / ``NoSuchBucket`` /
+    missing object = "never deployed") from unexpected ones (``AccessDenied``,
+    KMS failures, network errors). Unexpected failures still return ``{}`` so
+    the caller continues to a consistent state shape, but are also recorded
+    via ``_record_failure`` so ``main()`` exits non-zero.
+    """
     if not state_bucket:
         return {}
     try:
@@ -181,13 +253,27 @@ def load_state(s3_client, account_id: str, state_bucket: str) -> dict:
         return json.loads(obj["Body"].read())
     except s3_client.exceptions.NoSuchKey:
         return {}
-    except Exception as exc:  # noqa: BLE001 - state read failures must not abort deploy
-        LOG.warning("[%s] Could not read state: %s", account_id, exc)
+    except ClientError as exc:
+        code = _client_error_code(exc)
+        if code in _EXPECTED_LOAD_STATE_CODES:
+            LOG.info("[%s] No state object found (%s).", account_id, code)
+            return {}
+        _record_failure(
+            f"[{account_id}] Unexpected error reading state (code={code}): {exc}"
+        )
+        return {}
+    except Exception as exc:  # noqa: BLE001 - never abort deploy, but mark run failed
+        _record_failure(f"[{account_id}] Unexpected error reading state: {exc}")
         return {}
 
 
 def save_state(s3_client, account_id: str, state: dict, state_bucket: str) -> None:
-    """Persist ``state/<account_id>.json`` to S3, stamping ``last_execution`` in UTC."""
+    """Persist ``state/<account_id>.json`` to S3, stamping ``last_execution`` in UTC.
+
+    A write failure is treated as fatal for this account: it is recorded via
+    ``_record_failure`` so the overall run exits non-zero. IAM and the state
+    store silently diverging would otherwise bias future fast-path decisions.
+    """
     if not state_bucket:
         return
     try:
@@ -202,8 +288,8 @@ def save_state(s3_client, account_id: str, state: dict, state_bucket: str) -> No
             "[%s] State saved to s3://%s/state/%s.json",
             account_id, state_bucket, account_id,
         )
-    except Exception as exc:  # noqa: BLE001
-        LOG.error("[%s] Could not save state: %s", account_id, exc)
+    except Exception as exc:  # noqa: BLE001 - must not raise, but is a run failure
+        _record_failure(f"[{account_id}] Could not save state: {exc}")
 
 
 def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict) -> None:
@@ -247,13 +333,36 @@ def diff_policy(account_id: str, policy_name: str, old_doc: dict, new_doc: dict)
 
 
 def get_current_policy_doc(iam_client, policy_arn: str):
-    """Return the document of the default version of ``policy_arn``, or None on error."""
+    """Return the document of the default version of ``policy_arn``, or None.
+
+    ``NoSuchEntity`` is tolerated (the policy simply does not exist yet) and
+    returns ``None``. Any other error (``AccessDenied``, throttling, etc.) is
+    still returned as ``None`` so callers that treat None as "no document to
+    compare" keep working, but is recorded via ``_record_failure`` so the run
+    exits non-zero rather than silently skipping policy comparison.
+    """
     try:
         policy = iam_client.get_policy(PolicyArn=policy_arn)
         version_id = policy["Policy"]["DefaultVersionId"]
         version = iam_client.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)
         return version["PolicyVersion"]["Document"]
-    except Exception:  # noqa: BLE001 - any failure means "no document available"
+    except ClientError as exc:
+        code = _client_error_code(exc)
+        if code in _EXPECTED_GET_POLICY_CODES:
+            return None
+        _record_failure(
+            f"Could not read current document for {policy_arn} (code={code}): {exc}"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - preserve None return contract
+        # Preserve 'moto'-style exceptions that do not inherit from ClientError:
+        # a NoSuchEntity surfaced as a bare exception (e.g. in some test doubles)
+        # must remain tolerated, but anything else is a run failure.
+        if "NoSuchEntity" in type(exc).__name__:
+            return None
+        _record_failure(
+            f"Unexpected error reading current document for {policy_arn}: {exc}"
+        )
         return None
 
 
@@ -359,6 +468,10 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                                 "%s[%s] DRIFT detected on '%s'!",
                                 log_prefix, account_id, policy_name,
                             )
+                            _record_failure(
+                                f"[{account_id}] DRIFT detected on '{policy_name}' "
+                                f"(live document does not match last-deployed hash)."
+                            )
                         continue
 
                     policy_arn = f"arn:aws:iam::{account_id}:policy{path}{policy_name}"
@@ -429,7 +542,13 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
                             LOG.info("[%s] '%s' created.", account_id, policy_name)
 
                     except Exception as exc:  # noqa: BLE001 - per-policy failures must not stop the run
-                        LOG.error("[%s] Error on '%s': %s", account_id, policy_name, exc)
+                        # Record as a run failure so main() exits non-zero and
+                        # the CodeBuild/CodePipeline action fails loudly instead
+                        # of leaving the reviewed policy document un-applied
+                        # with a green pipeline (CWE-390).
+                        _record_failure(
+                            f"[{account_id}] Policy '{policy_name}' NOT applied: {exc}"
+                        )
 
                 if not args.dry_run and s3_client:
                     state["account_id"] = account_id
@@ -443,7 +562,13 @@ def create_update_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
-    """Return the set of account IDs that have a state file under ``state/`` in the bucket."""
+    """Return the set of account IDs that have a state file under ``state/`` in the bucket.
+
+    Any ``ListObjectsV2`` failure (``AccessDenied``, KMS error, etc.) returns
+    an empty set so the caller does not crash, but is also recorded via
+    ``_record_failure`` so the overall run exits non-zero — silently disabling
+    the off-boarded-account cleanup sweep is itself a governance failure.
+    """
     if not s3_client or not state_bucket:
         return set()
     try:
@@ -457,8 +582,11 @@ def get_previously_managed_accounts(s3_client, state_bucket: str) -> set:
             if account_id.isdigit():
                 accounts.add(account_id)
         return accounts
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning("Could not list state objects in S3: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - preserve set() return contract
+        _record_failure(
+            f"Could not list state objects in s3://{state_bucket}/state/ "
+            f"— off-boarded-account sweep did not run: {exc}"
+        )
         return set()
 
 
@@ -528,7 +656,12 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                     policies_state.pop(policy_name, None)
                     LOG.info("[%s] '%s' deleted.", account_id, policy_name)
             except Exception as exc:  # noqa: BLE001
-                LOG.error("[%s] Error deleting '%s': %s", account_id, policy_name, exc)
+                # A failed delete leaves a cx-mng:true policy in place that the
+                # assignments say must be gone — a privilege the commit intended
+                # to revoke is still granted. Record so main() exits non-zero.
+                _record_failure(
+                    f"[{account_id}] Policy '{policy_name}' NOT deleted: {exc}"
+                )
 
         if not args.dry_run and s3_client:
             state["account_id"] = account_id
@@ -543,7 +676,9 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
                     )
                     LOG.info("[%s] State removed from S3.", account_id)
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("[%s] Could not remove state: %s", account_id, exc)
+                    _record_failure(
+                        f"[{account_id}] Could not remove state: {exc}"
+                    )
 
 
 # --------------------------------------------------------------------------- #
@@ -552,10 +687,41 @@ def delete_customer_managed_policy(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    """Run create/update first, then delete. Always returns 0 (per-policy errors are logged)."""
+    """Run create/update then delete; return 0 iff every operation succeeded.
+
+    Per-policy and per-account errors do not abort the loop (so one bad account
+    does not block the rest), but each one is accumulated in ``_run_errors``.
+    If any failures were recorded, this returns 1 so the CodeBuild stage — and
+    therefore the CodePipeline action — is marked FAILED. This closes CWE-390
+    (Detection of Error Condition Without Action): operators rely on the stage
+    result, not on reading CloudWatch Logs.
+    """
+    _reset_run_errors()
     args = parse_args()
-    create_update_customer_managed_policy(args)
-    delete_customer_managed_policy(args)
+    try:
+        create_update_customer_managed_policy(args)
+    except Exception as exc:  # noqa: BLE001 - record and continue to delete phase
+        _record_failure(f"create/update phase aborted: {exc}")
+    try:
+        delete_customer_managed_policy(args)
+    except Exception as exc:  # noqa: BLE001 - record and surface via exit code
+        _record_failure(f"delete phase aborted: {exc}")
+
+    if _run_errors:
+        LOG.error(
+            "customer-managed-deploy completed with %d failure(s):",
+            len(_run_errors),
+        )
+        for idx, err in enumerate(_run_errors, 1):
+            LOG.error("  %d. %s", idx, err)
+        _notify(
+            subject="customer-managed-deploy FAILED",
+            message=(
+                f"{len(_run_errors)} failure(s) during customer-managed-deploy:\n"
+                + "\n".join(f"- {e}" for e in _run_errors)
+            ),
+        )
+        return 1
     return 0
 
 
