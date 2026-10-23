@@ -11,3 +11,19 @@ naming_convention = "cx-mng-pipeline"
 manual_approval   = true
 
 # external_id = "cole-aqui-o-valor-gerado-por-openssl-rand-hex-32"
+
+# -----------------------------------------------------------------------------
+# Scripts confiaveis (write-restricted + imutaveis).
+# O buildspec baixa este objeto S3 pinando pela version-id, verifica SHA-256
+# e so entao executa qualquer Python. Nenhum arquivo em source/*.py do
+# SourceOutput da branch rastreada e executado.
+# Gere o bundle a partir de um commit assinado e aprovado via CODEOWNERS:
+#   tar -czf scripts.tar.gz -C source .
+#   aws s3api put-object --bucket <bucket> --key scripts/<versao>.tar.gz --body scripts.tar.gz
+#   aws s3api head-object ...  # anote o VersionId retornado
+#   sha256sum scripts.tar.gz
+# -----------------------------------------------------------------------------
+# trusted_scripts_bucket     = "my-org-trusted-pipeline-scripts"
+# trusted_scripts_key        = "scripts/2024-01-15.tar.gz"
+# trusted_scripts_version_id = "abcDEF123versionIdFromS3"
+# trusted_scripts_sha256     = "0000000000000000000000000000000000000000000000000000000000000000"

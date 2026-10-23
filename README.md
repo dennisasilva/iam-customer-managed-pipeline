@@ -98,6 +98,51 @@ sequenceDiagram
 
 ## Pré-requisitos
 
+### 0. Scripts confiáveis (OBRIGATÓRIO antes do deploy)
+
+A pipeline **não executa mais os scripts Python vindos do `SourceOutput`** da
+branch rastreada. Cada estágio baixa um bundle imutável
+(`trusted_scripts_*` / `TrustedScripts*`) de um bucket S3 write-restricted,
+piná-lo pela `VersionId`, verifica o SHA-256 e só então executa Python.
+Isso impede que um push na branch monitorada substitua o próprio gate de
+validação.
+
+Antes do primeiro deploy (e sempre que `source/**/*.py` for alterado):
+
+1. Em um commit assinado e aprovado via CODEOWNERS, gere o bundle a partir
+   da raiz de `source/`:
+   ```bash
+   tar -czf scripts.tar.gz -C source .
+   sha256sum scripts.tar.gz    # anote o SHA-256
+   ```
+2. Suba o bundle para um bucket **separado** do bucket de artefatos (ideal:
+   em uma conta AWS diferente, com `Versioning` e `Object Lock` habilitados):
+   ```bash
+   aws s3api put-object --bucket <trusted-scripts-bucket> \
+     --key scripts/<data>.tar.gz --body scripts.tar.gz
+   # Anote o VersionId retornado.
+   ```
+3. Informe esses três valores à pipeline:
+   - CFN: parâmetros `TrustedScriptsBucket`, `TrustedScriptsKey`,
+     `TrustedScriptsVersionId`, `TrustedScriptsSha256`.
+   - Terraform: variáveis `trusted_scripts_bucket`, `trusted_scripts_key`,
+     `trusted_scripts_version_id`, `trusted_scripts_sha256`.
+4. Faça `cloudformation deploy` / `terraform apply` para que a pipeline
+   execute o novo bundle.
+
+### 0.1. Proteção de branch no provedor Git (OBRIGATÓRIO)
+
+O auto-trigger via push foi desabilitado (`DetectChanges=false`), mas o
+repo ainda precisa de proteção do lado do Git provider para fechar o loop.
+Ativar na branch (`BranchName`, padrão `main`), antes de deployar:
+
+- Require PR + approvals + revisão por `CODEOWNERS`.
+- Require **signed commits** (GPG / SSH / Sigstore).
+- Nega force-push / deleção, enforce para administradores.
+
+Detalhes passo-a-passo e checklist em
+[`docs/branch-protection.md`](docs/branch-protection.md).
+
 ### 1. GitHub Fine-Grained Personal Access Token
 
 Crie um token no GitHub com as seguintes permissões:

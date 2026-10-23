@@ -112,6 +112,52 @@
         - 'false'
       Default: 'true'
 
+    TrustedScriptsBucket:
+      Description: >
+        S3 bucket (write-restricted, versioning + object-lock recommended)
+        hosting the immutable Python scripts bundle used by every CodeBuild
+        stage. The bundle is downloaded + SHA-256 verified by the buildspec
+        BEFORE anything from the Source artifact is executed. Keep this
+        bucket in an account/role separate from the one that can push to
+        the tracked branch.
+      Type: String
+      MinLength: 3
+      MaxLength: 63
+      AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+      ConstraintDescription: 'Bucket name must be 3-63 chars, lowercase letters, numbers, dots and hyphens; must start and end with a letter or number.'
+
+    TrustedScriptsKey:
+      Description: >
+        S3 object key of the immutable scripts bundle (tar.gz) inside
+        TrustedScriptsBucket. The bundle must contain:
+          validation/customer-managed-validation.py
+          validation/role-validation.py
+          customer-managed-policies/customer-managed-deploy.py
+        Pin to a specific version-id (TrustedScriptsVersionId) and SHA-256
+        (TrustedScriptsSha256) so a push to the policy-data repo cannot
+        change the code the pipeline executes.
+      Type: String
+      MinLength: 1
+      MaxLength: 1024
+      AllowedPattern: '^[A-Za-z0-9._/-]+\.(tar\.gz|tgz)$'
+      ConstraintDescription: 'Scripts key must end with .tar.gz or .tgz and contain only letters, numbers, dots, underscores, slashes and hyphens.'
+
+    TrustedScriptsVersionId:
+      Description: 'S3 object version-id of TrustedScriptsKey. Pinning a version-id makes the download reproducible even if a mutator later overwrites the object.'
+      Type: String
+      MinLength: 1
+      MaxLength: 1024
+      AllowedPattern: '^[A-Za-z0-9._-]+$'
+      ConstraintDescription: 'Version id must contain only letters, numbers, dots, underscores and hyphens.'
+
+    TrustedScriptsSha256:
+      Description: 'Hex SHA-256 (64 lowercase hex chars) of TrustedScriptsKey (version TrustedScriptsVersionId). Compared byte-for-byte in the buildspec before any downloaded script is executed.'
+      Type: String
+      MinLength: 64
+      MaxLength: 64
+      AllowedPattern: '^[a-f0-9]{64}$'
+      ConstraintDescription: 'SHA-256 must be exactly 64 lowercase hexadecimal characters.'
+
   ## +------------------------------------------------------+ ##
   ## | Create a condition to select the CodeStarConnection  | ##
   ## +------------------------------------------------------+ ##
@@ -187,15 +233,31 @@
         TimeoutInMinutes: 480
         Source:
           Type: CODEPIPELINE
-          BuildSpec: |
+          BuildSpec: !Sub |
             version: 0.2
+            # Scripts are fetched from a write-restricted bucket pinned by
+            # version-id + SHA-256; nothing from source/ in SourceOutput is
+            # ever executed. The data (templates/*.json) still comes from
+            # SourceOutput, but it is pure JSON parsed by the trusted script.
+            env:
+              variables:
+                TRUSTED_SCRIPTS_BUCKET: "${TrustedScriptsBucket}"
+                TRUSTED_SCRIPTS_KEY: "${TrustedScriptsKey}"
+                TRUSTED_SCRIPTS_VERSION_ID: "${TrustedScriptsVersionId}"
+                TRUSTED_SCRIPTS_SHA256: "${TrustedScriptsSha256}"
             phases:
               build:
                 commands:
                   - echo "[INFO] [BUILD] Starting template validation process"
-                  - cd source/validation/
-                  - chmod +x customer-managed-validation.py
-                  - python3 customer-managed-validation.py --policies-folder '../../templates/customer-managed-policies/' --assignments-folder '../../templates/assignments/'
+                  - set -euo pipefail
+                  - TRUSTED_DIR="$(mktemp -d)"
+                  - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+                  - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+                  - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+                  - if [ "$ACTUAL_SHA" != "$TRUSTED_SCRIPTS_SHA256" ]; then echo "[FATAL] trusted scripts sha256 mismatch (got $ACTUAL_SHA expected $TRUSTED_SCRIPTS_SHA256)" >&2; exit 1; fi
+                  - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+                  - cd "$CODEBUILD_SRC_DIR"
+                  - python3 "$TRUSTED_DIR/scripts/validation/customer-managed-validation.py" --policies-folder './templates/customer-managed-policies/' --assignments-folder './templates/assignments/'
         Tags:
           - Key: "Name"
             Value: "Template-Validation-CodeBuild-Project"
@@ -227,15 +289,27 @@
           Type: CODEPIPELINE
         Source:
           Type: CODEPIPELINE
-          BuildSpec: |
+          BuildSpec: !Sub |
             version: 0.2
+            env:
+              variables:
+                TRUSTED_SCRIPTS_BUCKET: "${TrustedScriptsBucket}"
+                TRUSTED_SCRIPTS_KEY: "${TrustedScriptsKey}"
+                TRUSTED_SCRIPTS_VERSION_ID: "${TrustedScriptsVersionId}"
+                TRUSTED_SCRIPTS_SHA256: "${TrustedScriptsSha256}"
             phases:
               build:
                 commands:
                   - echo "[INFO] [BUILD] Starting Customer Managed Policies process"
-                  - cd source/customer-managed-policies/
-                  - chmod +x customer-managed-deploy.py
-                  - python3 customer-managed-deploy.py --state-bucket $STATE_BUCKET
+                  - set -euo pipefail
+                  - TRUSTED_DIR="$(mktemp -d)"
+                  - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+                  - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+                  - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+                  - if [ "$ACTUAL_SHA" != "$TRUSTED_SCRIPTS_SHA256" ]; then echo "[FATAL] trusted scripts sha256 mismatch (got $ACTUAL_SHA expected $TRUSTED_SCRIPTS_SHA256)" >&2; exit 1; fi
+                  - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+                  - cd "$CODEBUILD_SRC_DIR"
+                  - python3 "$TRUSTED_DIR/scripts/customer-managed-policies/customer-managed-deploy.py" --state-bucket "$STATE_BUCKET"
         Tags:
             - Key: "Name"
               Value: "Customer-Managed-Policies-CodeBuild-Project"
@@ -270,15 +344,27 @@
         TimeoutInMinutes: 480
         Source:
           Type: CODEPIPELINE
-          BuildSpec: |
+          BuildSpec: !Sub |
             version: 0.2
+            env:
+              variables:
+                TRUSTED_SCRIPTS_BUCKET: "${TrustedScriptsBucket}"
+                TRUSTED_SCRIPTS_KEY: "${TrustedScriptsKey}"
+                TRUSTED_SCRIPTS_VERSION_ID: "${TrustedScriptsVersionId}"
+                TRUSTED_SCRIPTS_SHA256: "${TrustedScriptsSha256}"
             phases:
               build:
                 commands:
                   - echo "[INFO] [BUILD] Starting dry-run process"
-                  - cd source/customer-managed-policies/
-                  - chmod +x customer-managed-deploy.py
-                  - python3 customer-managed-deploy.py --dry-run --state-bucket $STATE_BUCKET
+                  - set -euo pipefail
+                  - TRUSTED_DIR="$(mktemp -d)"
+                  - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+                  - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+                  - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+                  - if [ "$ACTUAL_SHA" != "$TRUSTED_SCRIPTS_SHA256" ]; then echo "[FATAL] trusted scripts sha256 mismatch (got $ACTUAL_SHA expected $TRUSTED_SCRIPTS_SHA256)" >&2; exit 1; fi
+                  - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+                  - cd "$CODEBUILD_SRC_DIR"
+                  - python3 "$TRUSTED_DIR/scripts/customer-managed-policies/customer-managed-deploy.py" --dry-run --state-bucket "$STATE_BUCKET"
         Tags:
           - Key: "Name"
             Value: "DryRun-CodeBuild-Project"
@@ -311,15 +397,27 @@
         TimeoutInMinutes: 480
         Source:
           Type: CODEPIPELINE
-          BuildSpec: |
+          BuildSpec: !Sub |
             version: 0.2
+            env:
+              variables:
+                TRUSTED_SCRIPTS_BUCKET: "${TrustedScriptsBucket}"
+                TRUSTED_SCRIPTS_KEY: "${TrustedScriptsKey}"
+                TRUSTED_SCRIPTS_VERSION_ID: "${TrustedScriptsVersionId}"
+                TRUSTED_SCRIPTS_SHA256: "${TrustedScriptsSha256}"
             phases:
               build:
                 commands:
                   - echo "[INFO] [BUILD] Starting role validation process"
-                  - cd source/validation/
-                  - chmod +x role-validation.py
-                  - python3 role-validation.py --assignments-folder '../../templates/assignments/'
+                  - set -euo pipefail
+                  - TRUSTED_DIR="$(mktemp -d)"
+                  - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+                  - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+                  - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+                  - if [ "$ACTUAL_SHA" != "$TRUSTED_SCRIPTS_SHA256" ]; then echo "[FATAL] trusted scripts sha256 mismatch (got $ACTUAL_SHA expected $TRUSTED_SCRIPTS_SHA256)" >&2; exit 1; fi
+                  - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+                  - cd "$CODEBUILD_SRC_DIR"
+                  - python3 "$TRUSTED_DIR/scripts/validation/role-validation.py" --assignments-folder './templates/assignments/'
         Tags:
           - Key: "Name"
             Value: "Role-Validation-CodeBuild-Project"
@@ -361,13 +459,31 @@
                     - logs:PutLogEvents
                   Resource: "*"
                 - Effect: Allow
+                  # Read the Source + upstream stage outputs. CodePipeline
+                  # artifact keys are '<pipeline-name>/<ArtifactName>/<hash>'.
                   Action:
                     - s3:GetObject
-                    - s3:PutObject
+                    - s3:GetObjectVersion
                     - s3:ListBucket
                   Resource:
                     - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
                     - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Write ONLY this stage's output artifact prefix. This stops
+                  # a compromised stage from rewriting SourceOutput or any
+                  # other stage's output artifact zip.
+                  Action:
+                    - s3:PutObject
+                    - s3:AbortMultipartUpload
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/${NamingConvention}-pipeline/RoleValidationOutput/*'
+                - Effect: Allow
+                  # Download the pinned, SHA-256-verified scripts bundle.
+                  Action:
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${TrustedScriptsBucket}/${TrustedScriptsKey}'
                 - Effect: Allow
                   # Required because the artifact bucket is encrypted with
                   # SSE-KMS (alias/aws/s3). The kms:ViaService condition
@@ -423,12 +539,24 @@
                 - Effect: Allow
                   Action:
                     - s3:GetObject
-                    - s3:PutObject
+                    - s3:GetObjectVersion
                     - s3:ListBucket
-                    - s3:AbortMultipartUpload
                   Resource:
                     - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
                     - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Write ONLY this stage's output artifact prefix.
+                  Action:
+                    - s3:PutObject
+                    - s3:AbortMultipartUpload
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/${NamingConvention}-pipeline/TemplateValidationOutput/*'
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${TrustedScriptsBucket}/${TrustedScriptsKey}'
                 - Effect: Allow
                   # Required because the artifact bucket is encrypted with
                   # SSE-KMS (alias/aws/s3). The kms:ViaService condition
@@ -479,13 +607,37 @@
                     - logs:PutLogEvents
                   Resource: "*"
                 - Effect: Allow
+                  # Read Source + upstream artifacts, and read/write state/.
+                  # State writes are additionally gated by the bucket policy's
+                  # RestrictStateWritesToDeployRole rule.
                   Action:
                     - s3:GetObject
-                    - s3:PutObject
+                    - s3:GetObjectVersion
                     - s3:ListBucket
                   Resource:
                     - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}'
                     - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/*'
+                - Effect: Allow
+                  # Write ONLY this stage's output artifact prefix (apply + dry-run share this role).
+                  Action:
+                    - s3:PutObject
+                    - s3:AbortMultipartUpload
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/${NamingConvention}-pipeline/CustomerManagedPoliciesOutput/*'
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/${NamingConvention}-pipeline/DryRunOutput/*'
+                - Effect: Allow
+                  # Drift-detection state file writes/deletes.
+                  Action:
+                    - s3:PutObject
+                    - s3:DeleteObject
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CxMgrartifactsBucket}/state/*'
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${TrustedScriptsBucket}/${TrustedScriptsKey}'
                 - Effect: Allow
                   # Required because the artifact bucket is encrypted with
                   # SSE-KMS (alias/aws/s3). The kms:ViaService condition
@@ -742,6 +894,13 @@
                   ConnectionArn: !If [ CreateCodeStarConnectionGitHub, !GetAtt CodeStarConnectionGitHub.ConnectionArn, !GetAtt CodeStarConnectionGitLab.ConnectionArn ]
                   FullRepositoryId: !Sub ${RepositoryOwner}/${RepositoryName}
                   BranchName: !Ref BranchName
+                  # Disable auto-trigger on push. The pipeline is released by a
+                  # human operator (StartPipelineExecution) only after they have
+                  # verified the commit signature, CODEOWNERS review, and the
+                  # TrustedScripts* parameters still match the intended script
+                  # bundle. See README "Secure release workflow".
+                  DetectChanges: "false"
+                  OutputArtifactFormat: "CODE_ZIP"
                 RunOrder: 1
                 OutputArtifacts:
                   - Name: SourceOutput

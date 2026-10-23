@@ -1,0 +1,25 @@
+# CODEOWNERS for iam-customer-managed-pipeline
+#
+# This repository is the policy-data repository tracked by the pipeline. It
+# must be protected on the Git provider side (see docs/branch-protection.md)
+# so that:
+#   * Push to the tracked branch requires a signed, CODEOWNERS-approved PR.
+#   * The pipeline itself is NOT auto-triggered (DetectChanges=false): a
+#     human operator starts the pipeline execution only after review.
+#
+# ALL changes to pipeline source code (source/**/*.py) and all pipeline IaC
+# (cfn/**, terraform/**, .github/**, CODEOWNERS) must be approved by the
+# security owners below. Changes to templates/*.json need normal review.
+
+# Pipeline source code - any change requires a security owner approval.
+/source/                        @dennisasilva/security-owners
+/scripts/                       @dennisasilva/security-owners
+
+# Pipeline infrastructure (buildspecs, IAM, S3, pipeline wiring).
+/cfn/                           @dennisasilva/security-owners
+/terraform/                     @dennisasilva/security-owners
+
+# Governance files themselves must be protected.
+/CODEOWNERS                     @dennisasilva/security-owners
+/.github/                       @dennisasilva/security-owners
+/docs/branch-protection.md      @dennisasilva/security-owners

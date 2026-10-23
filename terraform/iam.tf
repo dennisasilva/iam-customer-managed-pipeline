@@ -47,9 +47,26 @@ resource "aws_iam_role_policy" "template_validation" {
     Statement = [
       local.logs_statement,
       {
+        # Leitura do SourceOutput + listagem.
         Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:AbortMultipartUpload"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"]
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
+      },
+      {
+        # Escrita escopada ao proprio prefixo de saida deste estagio.
+        Effect = "Allow"
+        Action = ["s3:PutObject", "s3:AbortMultipartUpload"]
+        Resource = [
+          "${local.bucket_arn}/${var.naming_convention}-pipeline/TemplateValidationOutput/*",
+        ]
+      },
+      {
+        # Download do bundle imutavel de scripts (SHA-256 verificado).
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = [
+          "arn:aws:s3:::${var.trusted_scripts_bucket}/${var.trusted_scripts_key}",
+        ]
       },
       local.kms_via_s3_statement,
     ]
@@ -73,8 +90,23 @@ resource "aws_iam_role_policy" "role_validation" {
       local.logs_statement,
       {
         Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"]
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
+      },
+      {
+        # Escrita escopada ao proprio prefixo de saida deste estagio.
+        Effect = "Allow"
+        Action = ["s3:PutObject", "s3:AbortMultipartUpload"]
+        Resource = [
+          "${local.bucket_arn}/${var.naming_convention}-pipeline/RoleValidationOutput/*",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = [
+          "arn:aws:s3:::${var.trusted_scripts_bucket}/${var.trusted_scripts_key}",
+        ]
       },
       local.kms_via_s3_statement,
       {
@@ -103,8 +135,32 @@ resource "aws_iam_role_policy" "customer_managed_policies" {
       local.logs_statement,
       {
         Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"]
         Resource = [local.bucket_arn, "${local.bucket_arn}/*"]
+      },
+      {
+        # Apply + dry-run compartilham a role, cada um escreve apenas no seu
+        # proprio prefixo de saida (nao pode reescrever SourceOutput nem o
+        # artefato de outro estagio).
+        Effect = "Allow"
+        Action = ["s3:PutObject", "s3:AbortMultipartUpload"]
+        Resource = [
+          "${local.bucket_arn}/${var.naming_convention}-pipeline/CustomerManagedPoliciesOutput/*",
+          "${local.bucket_arn}/${var.naming_convention}-pipeline/DryRunOutput/*",
+        ]
+      },
+      {
+        # Drift state writes/deletes (ainda limitado por bucket policy).
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:DeleteObject"]
+        Resource = ["${local.bucket_arn}/state/*"]
+      },
+      {
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = [
+          "arn:aws:s3:::${var.trusted_scripts_bucket}/${var.trusted_scripts_key}",
+        ]
       },
       local.kms_via_s3_statement,
       {

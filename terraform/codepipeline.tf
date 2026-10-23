@@ -26,7 +26,12 @@ resource "aws_codepipeline" "pipeline" {
         ConnectionArn    = local.connection_arn
         FullRepositoryId = "${var.repository_owner}/${var.repository_name}"
         BranchName       = var.branch_name
-        DetectChanges    = "true"
+        # Auto-trigger desligado. A pipeline so roda via StartPipelineExecution
+        # (humano), apos o operador verificar: (a) assinatura do commit,
+        # (b) revisao CODEOWNERS e (c) que os parametros trusted_scripts_*
+        # continuam apontando para o bundle intencionado.
+        DetectChanges        = "false"
+        OutputArtifactFormat = "CODE_ZIP"
       }
     }
   }

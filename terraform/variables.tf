@@ -65,6 +65,52 @@ variable "manual_approval" {
 }
 
 # ---------------------------------------------------------------------------
+# Scripts confiáveis (write-restricted + imutáveis). O buildspec baixa este
+# objeto S3 pinando pela version-id, verifica SHA-256 e só então executa
+# qualquer Python. Nenhum arquivo de source/ no SourceOutput da branch
+# rastreada é executado.
+# ---------------------------------------------------------------------------
+variable "trusted_scripts_bucket" {
+  description = "Bucket S3 (write-restricted) que hospeda o bundle imutável de scripts (.tar.gz)."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.trusted_scripts_bucket))
+    error_message = "trusted_scripts_bucket deve ser um nome válido de bucket S3 (3-63 chars, lowercase)."
+  }
+}
+
+variable "trusted_scripts_key" {
+  description = "Chave S3 do bundle de scripts (.tar.gz / .tgz) dentro de trusted_scripts_bucket."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._/-]+\\.(tar\\.gz|tgz)$", var.trusted_scripts_key))
+    error_message = "trusted_scripts_key deve terminar em .tar.gz ou .tgz."
+  }
+}
+
+variable "trusted_scripts_version_id" {
+  description = "Version-id S3 do objeto trusted_scripts_key. Pinar a version-id torna o download reprodutível mesmo se o objeto for sobrescrito."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._-]+$", var.trusted_scripts_version_id))
+    error_message = "trusted_scripts_version_id deve conter apenas letras, números, pontos, underscores e hífens."
+  }
+}
+
+variable "trusted_scripts_sha256" {
+  description = "SHA-256 (64 hex chars minúsculos) do bundle apontado por trusted_scripts_key@trusted_scripts_version_id. Comparado byte-a-byte no buildspec antes de executar qualquer script."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-f0-9]{64}$", var.trusted_scripts_sha256))
+    error_message = "trusted_scripts_sha256 deve ser exatamente 64 caracteres hexadecimais em minúsculo."
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Observação de escopo (paridade com o CloudFormation):
 #
 # O template CFN também cria um recurso AWS::CodeStar::GitHubRepository, que

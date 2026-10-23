@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Projetos CodeBuild (paridade com os 4 projects do CFN).
+#
+# Nenhum arquivo em source/*.py do SourceOutput da branch rastreada e
+# executado. Cada buildspec baixa um bundle imutavel de scripts
+# (TRUSTED_SCRIPTS_*) pinando pela S3 version-id, verifica SHA-256 e so
+# depois executa Python.
 
 locals {
   codebuild_image = "aws/codebuild/amazonlinux2-x86_64-standard:5.0"
@@ -10,9 +15,15 @@ locals {
       build:
         commands:
           - echo "[INFO] [BUILD] Starting template validation process"
-          - cd source/validation/
-          - chmod +x customer-managed-validation.py
-          - python3 customer-managed-validation.py --policies-folder '../../templates/customer-managed-policies/' --assignments-folder '../../templates/assignments/'
+          - set -euo pipefail
+          - TRUSTED_DIR="$(mktemp -d)"
+          - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+          - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+          - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+          - test "$ACTUAL_SHA" = "$TRUSTED_SCRIPTS_SHA256" || { echo "[FATAL] trusted scripts sha256 mismatch" >&2; exit 1; }
+          - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+          - cd "$CODEBUILD_SRC_DIR"
+          - python3 "$TRUSTED_DIR/scripts/validation/customer-managed-validation.py" --policies-folder './templates/customer-managed-policies/' --assignments-folder './templates/assignments/'
   EOT
 
   buildspec_role_validation = <<-EOT
@@ -21,9 +32,15 @@ locals {
       build:
         commands:
           - echo "[INFO] [BUILD] Starting role validation process"
-          - cd source/validation/
-          - chmod +x role-validation.py
-          - python3 role-validation.py --assignments-folder '../../templates/assignments/'
+          - set -euo pipefail
+          - TRUSTED_DIR="$(mktemp -d)"
+          - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+          - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+          - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+          - test "$ACTUAL_SHA" = "$TRUSTED_SCRIPTS_SHA256" || { echo "[FATAL] trusted scripts sha256 mismatch" >&2; exit 1; }
+          - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+          - cd "$CODEBUILD_SRC_DIR"
+          - python3 "$TRUSTED_DIR/scripts/validation/role-validation.py" --assignments-folder './templates/assignments/'
   EOT
 
   buildspec_dry_run = <<-EOT
@@ -32,9 +49,15 @@ locals {
       build:
         commands:
           - echo "[INFO] [BUILD] Starting dry-run process"
-          - cd source/customer-managed-policies/
-          - chmod +x customer-managed-deploy.py
-          - python3 customer-managed-deploy.py --dry-run --state-bucket $STATE_BUCKET
+          - set -euo pipefail
+          - TRUSTED_DIR="$(mktemp -d)"
+          - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+          - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+          - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+          - test "$ACTUAL_SHA" = "$TRUSTED_SCRIPTS_SHA256" || { echo "[FATAL] trusted scripts sha256 mismatch" >&2; exit 1; }
+          - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+          - cd "$CODEBUILD_SRC_DIR"
+          - python3 "$TRUSTED_DIR/scripts/customer-managed-policies/customer-managed-deploy.py" --dry-run --state-bucket "$STATE_BUCKET"
   EOT
 
   buildspec_deploy = <<-EOT
@@ -43,9 +66,15 @@ locals {
       build:
         commands:
           - echo "[INFO] [BUILD] Starting Customer Managed Policies process"
-          - cd source/customer-managed-policies/
-          - chmod +x customer-managed-deploy.py
-          - python3 customer-managed-deploy.py --state-bucket $STATE_BUCKET
+          - set -euo pipefail
+          - TRUSTED_DIR="$(mktemp -d)"
+          - BUNDLE="$TRUSTED_DIR/scripts.tar.gz"
+          - aws s3api get-object --bucket "$TRUSTED_SCRIPTS_BUCKET" --key "$TRUSTED_SCRIPTS_KEY" --version-id "$TRUSTED_SCRIPTS_VERSION_ID" "$BUNDLE" >/dev/null
+          - ACTUAL_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+          - test "$ACTUAL_SHA" = "$TRUSTED_SCRIPTS_SHA256" || { echo "[FATAL] trusted scripts sha256 mismatch" >&2; exit 1; }
+          - mkdir -p "$TRUSTED_DIR/scripts" && tar -xzf "$BUNDLE" -C "$TRUSTED_DIR/scripts"
+          - cd "$CODEBUILD_SRC_DIR"
+          - python3 "$TRUSTED_DIR/scripts/customer-managed-policies/customer-managed-deploy.py" --state-bucket "$STATE_BUCKET"
   EOT
 }
 
@@ -66,6 +95,22 @@ resource "aws_codebuild_project" "template_validation" {
     environment_variable {
       name  = "REGION"
       value = local.region
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_BUCKET"
+      value = var.trusted_scripts_bucket
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_KEY"
+      value = var.trusted_scripts_key
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_VERSION_ID"
+      value = var.trusted_scripts_version_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_SHA256"
+      value = var.trusted_scripts_sha256
     }
   }
 
@@ -94,6 +139,22 @@ resource "aws_codebuild_project" "role_validation" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_BUCKET"
+      value = var.trusted_scripts_bucket
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_KEY"
+      value = var.trusted_scripts_key
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_VERSION_ID"
+      value = var.trusted_scripts_version_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_SHA256"
+      value = var.trusted_scripts_sha256
     }
   }
 
@@ -126,6 +187,22 @@ resource "aws_codebuild_project" "dry_run" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_BUCKET"
+      value = var.trusted_scripts_bucket
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_KEY"
+      value = var.trusted_scripts_key
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_VERSION_ID"
+      value = var.trusted_scripts_version_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_SHA256"
+      value = var.trusted_scripts_sha256
     }
   }
 
@@ -162,6 +239,22 @@ resource "aws_codebuild_project" "customer_managed_policies" {
     environment_variable {
       name  = "EXTERNAL_ID"
       value = var.external_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_BUCKET"
+      value = var.trusted_scripts_bucket
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_KEY"
+      value = var.trusted_scripts_key
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_VERSION_ID"
+      value = var.trusted_scripts_version_id
+    }
+    environment_variable {
+      name  = "TRUSTED_SCRIPTS_SHA256"
+      value = var.trusted_scripts_sha256
     }
   }
 
